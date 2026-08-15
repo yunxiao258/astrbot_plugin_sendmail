@@ -1,0 +1,14 @@
+# Python 编译缓存与虚拟环境
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 运行时数据（绝不入库：含全局配置与敏感信息）
+data/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
