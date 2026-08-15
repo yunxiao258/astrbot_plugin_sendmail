@@ -300,25 +300,56 @@ class SendMailPlugin(Star):
 
     # ==================== Agent Mail CLI 通道 ====================
 
-    def _agently_cmd(self) -> str:
-        """agently-cli 可执行文件：配置指定优先，其次解析 PATH 中的真实 exe。
-        Windows 下 npm 全局安装的是 .cmd shim，subprocess 无法直接执行，需解析到 node_modules 中的真实 exe。"""
+    def _agently_cmd(self) -> list[str]:
+        """agently-cli 启动命令（列表形式，供 subprocess 直接执行）。
+
+        优先使用配置指定的可执行文件；否则解析 PATH 中的 npm 全局安装：
+        Windows 下 npm 装的是 .cmd shim，经 cmd.exe 执行时命令行中的换行会被
+        截断（多行正文会丢行），故解析到 node.exe + 包内主入口（scripts/run.js）
+        直接调用，彻底绕过 cmd.exe。
+        """
         cfg = str(self.config.get("agently_cli_path", "")).strip()
         if cfg:
-            return cfg
+            if cfg.lower().endswith((".cmd", ".bat")):
+                # 用户指定了 shim，仍尝试解析为 node + 主入口
+                inner = self._agently_from_shim(cfg)
+                if inner:
+                    return inner
+            return [cfg]
         exe = shutil.which("agently-cli") or shutil.which("agently-cli.exe") or ""
         if not exe:
-            return "agently-cli"
+            return ["agently-cli"]
         if exe.lower().endswith((".cmd", ".bat")):
-            base = os.path.dirname(exe)
-            for npm_root in (base, os.path.dirname(base)):
-                real = os.path.join(
-                    npm_root, "node_modules", "@tencent-qqmail",
-                    "agently-cli", "agently-cli.exe",
-                )
-                if os.path.isfile(real):
-                    return real
-        return exe
+            inner = self._agently_from_shim(exe)
+            if inner:
+                return inner
+        return [exe]
+
+    @staticmethod
+    def _agently_from_shim(shim: str) -> list[str] | None:
+        """将 npm .cmd shim 解析为 [node.exe, 包主入口]；失败返回 None"""
+        npm_root = os.path.dirname(os.path.abspath(shim))
+        pkg_dir = os.path.join(
+            npm_root, "node_modules", "@tencent-qqmail", "agently-cli"
+        )
+        if not os.path.isdir(pkg_dir):
+            return None
+        entry = "scripts/run.js"
+        pkg_file = os.path.join(pkg_dir, "package.json")
+        try:
+            with open(pkg_file, encoding="utf-8") as f:
+                bin_map = json.load(f).get("bin") or {}
+            if bin_map:
+                entry = next(iter(bin_map.values()))
+        except Exception:
+            pass
+        main_js = os.path.join(pkg_dir, entry)
+        if not os.path.isfile(main_js):
+            return None
+        node = shutil.which("node") or os.environ.get("NODE_EXE") or ""
+        if not node:
+            return None
+        return [node, main_js]
 
     @staticmethod
     def _agently_missing_hint() -> str:
@@ -367,7 +398,7 @@ class SendMailPlugin(Star):
                         attach_args += ["--attachment", os.path.basename(local)]
 
             # 2) 组装并执行 CLI
-            cmd = [self._agently_cmd(), "message", "+send", "--confirmed"]
+            cmd = self._agently_cmd() + ["message", "+send", "--confirmed"]
             for r in recipients:
                 cmd += ["--to", r]
             cmd += ["--subject", subject]

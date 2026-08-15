@@ -466,7 +466,7 @@ class FakeProc:
 class TestAgentlySend(unittest.TestCase):
     def test_send_success_with_url_attachment(self):
         p = make_plugin(send_channel="agently")
-        p._agently_cmd = lambda: "agently-cli"
+        p._agently_cmd = lambda: ["node", r"C:\tools\agently-cli\scripts\run.js"]
         calls = {}
 
         def fake_run(cmd, **kwargs):
@@ -482,8 +482,8 @@ class TestAgentlySend(unittest.TestCase):
             )
         self.assertEqual(failed, [])
         cmd = calls["cmd"]
-        self.assertEqual(cmd[0], "agently-cli")
-        self.assertEqual(cmd[1:3], ["message", "+send"])
+        self.assertEqual(cmd[0:2], ["node", r"C:\tools\agently-cli\scripts\run.js"])
+        self.assertEqual(cmd[2:4], ["message", "+send"])
         self.assertIn("--confirmed", cmd)
         self.assertIn("--to", cmd)
         self.assertIn("a@b.com", cmd)
@@ -608,13 +608,25 @@ class TestAgentlySend(unittest.TestCase):
 
 class TestAgentlyCommand(unittest.TestCase):
     def test_agently_cmd_resolved(self):
-        # 真实环境：应解析出可用的 agently-cli 路径（配置指定优先）
+        # 真实环境：应解析出可用的 agently-cli 命令（配置指定优先）
         p = make_plugin(agently_cli_path="C:\\tools\\agently-cli.exe")
-        self.assertEqual(p._agently_cmd(), "C:\\tools\\agently-cli.exe")
+        self.assertEqual(p._agently_cmd(), ["C:\\tools\\agently-cli.exe"])
         p2 = make_plugin(agently_cli_path="")
         cmd = p2._agently_cmd()
         self.assertTrue(cmd, "应解析出非空命令")
-        self.assertTrue(os.path.exists(cmd.split(" ")[0]) or os.path.exists(cmd))
+        self.assertTrue(os.path.exists(cmd[0]), f"命令应存在: {cmd}")
+
+    def test_agently_shim_resolved_to_node(self):
+        # Windows npm .cmd shim 应解析为 [node.exe, 包主入口]，绕过 cmd.exe 换行截断
+        shim = shutil.which("agently-cli")
+        if not shim:
+            self.skipTest("本机未安装 agently-cli")
+        inner = SendMailPlugin._agently_from_shim(shim)
+        self.assertIsNotNone(inner)
+        self.assertEqual(len(inner), 2)
+        self.assertTrue(os.path.exists(inner[0]), f"node 应存在: {inner[0]}")
+        self.assertTrue(os.path.exists(inner[1]), f"主入口应存在: {inner[1]}")
+        self.assertTrue(inner[1].endswith((".js", ".cjs", ".mjs")))
 
     def test_agently_channel_dispatch_success(self):
         p = make_plugin(send_channel="agently")
