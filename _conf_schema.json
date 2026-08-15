@@ -1,4 +1,9 @@
 {
+  "send_channel": {
+    "description": "发送通道：smtp（邮箱 SMTP 授权码）/ agently（Agent Mail CLI，需 npm 安装 agently-cli 并完成 auth login 授权）",
+    "type": "string",
+    "default": "smtp"
+  },
   "smtp_provider": {
     "description": "邮件服务商预设：qq / gmail / 163 / custom（自定义需另填 smtp_host、smtp_port）",
     "type": "string",
@@ -53,5 +58,15 @@
     "description": "两次发送的最小间隔秒数（防滥用）",
     "type": "int",
     "default": 30
+  },
+  "agently_attach_max_mb": {
+    "description": "Agent Mail CLI 通道单个附件大小上限（MB，服务端上限 20MB）",
+    "type": "int",
+    "default": 20
+  },
+  "agently_cli_path": {
+    "description": "agently-cli 可执行文件路径（留空自动在 PATH 中查找）",
+    "type": "string",
+    "default": ""
   }
 }

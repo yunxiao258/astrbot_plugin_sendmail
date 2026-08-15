@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """sendmail 插件单元测试：命令解析、MIME 构建、发送流程、权限与频率限制"""
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -393,6 +394,209 @@ class TestCommand(unittest.TestCase):
             p._last_send_at = 0.0
             result = asyncio.run(p.cmd_mail(FakeEvent(cmd)))
             self.assertIn("已发送到", reply_text(result), cmd)
+
+
+# ==================== Agent Mail CLI 通道 ====================
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class TestAgentlySend(unittest.TestCase):
+    def test_send_success_with_url_attachment(self):
+        p = make_plugin(send_channel="agently")
+        p._agently_cmd = lambda: "agently-cli"
+        calls = {}
+
+        def fake_run(cmd, **kwargs):
+            calls["cmd"] = cmd
+            calls["cwd"] = kwargs.get("cwd")
+            return FakeProc(0, json.dumps({"ok": True, "data": {}}))
+
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run", fake_run), \
+             mock.patch("astrbot_plugin_sendmail.main.httpx.Client",
+                        lambda **k: FakeClient(b"PDFBYTES")):
+            failed = p._send_agently_sync(
+                ["a@b.com", "c@d.com"], "主题", "你好", [("url", "https://x.com/r.pdf")], 10
+            )
+        self.assertEqual(failed, [])
+        cmd = calls["cmd"]
+        self.assertEqual(cmd[0], "agently-cli")
+        self.assertEqual(cmd[1:3], ["message", "+send"])
+        self.assertIn("--confirmed", cmd)
+        self.assertIn("--to", cmd)
+        self.assertIn("a@b.com", cmd)
+        self.assertIn("c@d.com", cmd)
+        self.assertIn("--subject", cmd)
+        # 附件相对路径（位于临时工作目录）
+        att = cmd[cmd.index("--attachment") + 1]
+        self.assertIn("r.pdf", att)
+        self.assertNotIn(":", att)  # 不能是绝对路径
+        # 临时工作目录已清理
+        self.assertFalse(os.path.exists(calls["cwd"]))
+
+    def test_send_local_file_attachment(self):
+        p = make_plugin(send_channel="agently")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc(0, json.dumps({"ok": True}))
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as f:
+            f.write(b"ZIP")
+            path = f.name
+        try:
+            with mock.patch("astrbot_plugin_sendmail.main.subprocess.run", fake_run):
+                failed = p._send_agently_sync(["a@b.com"], "主题", "正文", [("file", path)], 10)
+        finally:
+            os.unlink(path)
+        self.assertEqual(failed, [])
+        att = calls[0][calls[0].index("--attachment") + 1]
+        self.assertIn(".zip", att)
+
+    def test_send_plain_body_format(self):
+        p = make_plugin(send_channel="agently", mail_html=False)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc(0, '{"ok": true}')
+
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run", fake_run):
+            p._send_agently_sync(["a@b.com"], "主题", "纯文本", [], 10)
+        self.assertIn("--body-format", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--body-format") + 1], "plain")
+
+    def test_send_html_body_auto(self):
+        p = make_plugin(send_channel="agently")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc(0, '{"ok": true}')
+
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run", fake_run):
+            p._send_agently_sync(["a@b.com"], "主题", "你好\n第二行", [], 10)
+        body = calls[0][calls[0].index("--body") + 1]
+        self.assertIn("<p>", body)
+        self.assertNotIn("--body-format", calls[0])
+
+    def test_send_cli_error_reported(self):
+        p = make_plugin(send_channel="agently")
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run",
+                        lambda *a, **k: FakeProc(1, "", "认证失败")):
+            with self.assertRaises(RuntimeError) as ctx:
+                p._send_agently_sync(["a@b.com"], "主题", "正文", [], 10)
+        self.assertIn("认证失败", str(ctx.exception))
+
+    def test_send_not_ok_json(self):
+        p = make_plugin(send_channel="agently")
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run",
+                        lambda *a, **k: FakeProc(0, json.dumps({"ok": False, "message": "quota exceeded"}))):
+            with self.assertRaises(RuntimeError) as ctx:
+                p._send_agently_sync(["a@b.com"], "主题", "正文", [], 10)
+        self.assertIn("quota exceeded", str(ctx.exception))
+
+    def test_send_cli_missing(self):
+        p = make_plugin(send_channel="agently")
+
+        def missing(cmd, **kwargs):
+            raise FileNotFoundError(cmd[0])
+
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run", missing):
+            with self.assertRaises(RuntimeError) as ctx:
+                p._send_agently_sync(["a@b.com"], "主题", "正文", [], 10)
+        self.assertIn("npm install -g", str(ctx.exception))
+
+    def test_send_download_failure_keeps_sending(self):
+        p = make_plugin(send_channel="agently")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc(0, '{"ok": true}')
+
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run", fake_run), \
+             mock.patch("astrbot_plugin_sendmail.main.httpx.Client",
+                        lambda **k: FakeClient(b"", raise_on={"https://x.com/bad.pdf"})):
+            failed = p._send_agently_sync(
+                ["a@b.com"], "主题", "正文", [("url", "https://x.com/bad.pdf")], 10
+            )
+        self.assertEqual(failed, ["bad.pdf"])
+        # 失败的附件不进命令参数
+        self.assertNotIn("--attachment", calls[0])
+
+    def test_url_attachment_too_large(self):
+        p = make_plugin(send_channel="agently", agently_attach_max_mb=1)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc(0, '{"ok": true}')
+
+        with mock.patch("astrbot_plugin_sendmail.main.subprocess.run", fake_run), \
+             mock.patch("astrbot_plugin_sendmail.main.httpx.Client",
+                        lambda **k: FakeClient(b"X" * (2 * 1024 * 1024))):
+            failed = p._send_agently_sync(
+                ["a@b.com"], "主题", "正文", [("url", "https://x.com/big.pdf")], 1
+            )
+        self.assertIn("big.pdf", failed[0])
+        self.assertNotIn("--attachment", calls[0])
+
+
+class TestAgentlyCommand(unittest.TestCase):
+    def test_agently_cmd_resolved(self):
+        # 真实环境：应解析出可用的 agently-cli 路径（配置指定优先）
+        p = make_plugin(agently_cli_path="C:\\tools\\agently-cli.exe")
+        self.assertEqual(p._agently_cmd(), "C:\\tools\\agently-cli.exe")
+        p2 = make_plugin(agently_cli_path="")
+        cmd = p2._agently_cmd()
+        self.assertTrue(cmd, "应解析出非空命令")
+        self.assertTrue(os.path.exists(cmd.split(" ")[0]) or os.path.exists(cmd))
+
+    def test_agently_channel_dispatch_success(self):
+        p = make_plugin(send_channel="agently")
+        calls = []
+
+        def fake_send(recipients, subject, body, attachments, max_mb):
+            calls.append((recipients, subject))
+            return []
+
+        p._send_agently_sync = fake_send
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 a@b.com | 主题 | 正文")))
+        text = reply_text(result)
+        self.assertIn("已发送到", text)
+        self.assertEqual(calls, [(["a@b.com"], "主题")])
+        self.assertEqual(p._history[0]["channel"], "agently")
+
+    def test_agently_channel_dispatch_failure(self):
+        p = make_plugin(send_channel="agently")
+
+        def boom(recipients, subject, body, attachments, max_mb):
+            raise RuntimeError("agently 未授权")
+
+        p._send_agently_sync = boom
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 a@b.com | 主题 | 正文")))
+        self.assertIn("发送失败", reply_text(result))
+
+    def test_channel_dirty_value_falls_back_smtp(self):
+        # 非法通道回退 smtp（走 SMTP 构建流程）
+        p = make_plugin(send_channel="别的东西")
+        calls = []
+
+        def fake_send(msg, max_mb):
+            calls.append(msg["To"])
+            return []
+
+        p._send_sync = fake_send
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 a@b.com | 主题 | 正文")))
+        self.assertIn("已发送到", reply_text(result))
+        self.assertEqual(calls, ["a@b.com"])
+        self.assertEqual(p._history[0]["channel"], "smtp")
 
 
 if __name__ == "__main__":

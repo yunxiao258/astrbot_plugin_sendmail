@@ -14,7 +14,10 @@ import html
 import json
 import os
 import re
+import shutil
 import smtplib
+import subprocess
+import tempfile
 import time
 import urllib.parse
 from email.header import Header
@@ -63,7 +66,8 @@ HELP_TEXT = (
     "/邮件 帮助\n"
     "示例：/邮件 a@qq.com,b@163.com | 周报 | 本周数据见附件\n"
     "--附件=https://example.com/report.pdf\n"
-    "正文包含 HTML 标签时按 HTML 渲染，普通文本自动转义。"
+    "正文包含 HTML 标签时按 HTML 渲染，普通文本自动转义。\n"
+    "发送通道：smtp（SMTP 授权码）/ agently（Agent Mail CLI）"
 )
 
 
@@ -291,6 +295,120 @@ class SendMailPlugin(Star):
                 pass
         return failed
 
+    # ==================== Agent Mail CLI 通道 ====================
+
+    def _agently_cmd(self) -> str:
+        """agently-cli 可执行文件：配置指定优先，其次解析 PATH 中的真实 exe。
+        Windows 下 npm 全局安装的是 .cmd shim，subprocess 无法直接执行，需解析到 node_modules 中的真实 exe。"""
+        cfg = str(self.config.get("agently_cli_path", "")).strip()
+        if cfg:
+            return cfg
+        exe = shutil.which("agently-cli") or shutil.which("agently-cli.exe") or ""
+        if not exe:
+            return "agently-cli"
+        if exe.lower().endswith((".cmd", ".bat")):
+            base = os.path.dirname(exe)
+            for npm_root in (base, os.path.dirname(base)):
+                real = os.path.join(
+                    npm_root, "node_modules", "@tencent-qqmail",
+                    "agently-cli", "agently-cli.exe",
+                )
+                if os.path.isfile(real):
+                    return real
+        return exe
+
+    @staticmethod
+    def _agently_missing_hint() -> str:
+        return (
+            "❌ 未安装或无法执行 agently-cli。请安装并授权：\n"
+            "npm install -g @tencent-qqmail/agently-cli\n"
+            "agently-cli auth login"
+        )
+
+    def _send_agently_sync(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        attachments: list[tuple[str, str]],
+        max_mb: int,
+    ) -> list[str]:
+        """通过 Agent Mail CLI 发送（CLI 附件路径必须相对当前目录，故先归集到临时目录）；
+        返回下载失败的附件名列表；发送失败抛 RuntimeError。"""
+        failed: list[str] = []
+        workdir = tempfile.mkdtemp(prefix="agently_")
+        attach_args: list[str] = []
+        try:
+            # 1) 归集附件到临时工作目录（URL 下载 / 本地复制），生成相对路径参数
+            with httpx.Client(timeout=30, follow_redirects=True) as client:
+                for i, (kind, value) in enumerate(attachments):
+                    if kind == "url":
+                        name = self._filename_from_url(value)
+                        try:
+                            resp = client.get(value)
+                            resp.raise_for_status()
+                            data = resp.content
+                            if len(data) > max_mb * 1024 * 1024:
+                                failed.append(f"{name}(超过 {max_mb}MB)")
+                                continue
+                            local = os.path.join(workdir, f"{i}_{name}")
+                            with open(local, "wb") as f:
+                                f.write(data)
+                            attach_args += ["--attachment", os.path.basename(local)]
+                        except Exception as e:
+                            logger.warning(f"下载附件失败 {value}: {e}")
+                            failed.append(name)
+                    else:
+                        local = os.path.join(workdir, f"{i}_{os.path.basename(value)}")
+                        shutil.copy2(value, local)
+                        attach_args += ["--attachment", os.path.basename(local)]
+
+            # 2) 组装并执行 CLI
+            cmd = [self._agently_cmd(), "message", "+send", "--confirmed"]
+            for r in recipients:
+                cmd += ["--to", r]
+            cmd += ["--subject", subject]
+            html_mode = self._bool_cfg("mail_html", True)
+            if html_mode:
+                cmd += ["--body", _to_html(body)]
+            else:
+                cmd += ["--body", body, "--body-format", "plain"]
+            cmd += attach_args
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=workdir,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=180,
+                )
+            except FileNotFoundError:
+                raise RuntimeError(self._agently_missing_hint())
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("❌ Agent Mail CLI 发送超时（180 秒），请重试")
+
+            out = (proc.stdout or "").strip()
+            err = (proc.stderr or "").strip()
+            if proc.returncode != 0:
+                raise RuntimeError(f"❌ Agent Mail CLI 发送失败: {err or out or f'exit {proc.returncode}'}")
+
+            # 3) 解析 JSON 结果
+            try:
+                data = json.loads(out)
+            except json.JSONDecodeError:
+                if "ok" in out or "成功" in out:
+                    return failed
+                raise RuntimeError(f"❌ Agent Mail CLI 返回异常: {out or err or '无输出'}")
+            if not data.get("ok", True):
+                raise RuntimeError(
+                    f"❌ Agent Mail CLI 发送失败: {data.get('message') or data.get('error') or data}"
+                )
+            return failed
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
     # ==================== 指令 ====================
 
     def _send_text(self, event: AstrMessageEvent, text: str):
@@ -348,15 +466,24 @@ class SendMailPlugin(Star):
             else:
                 attachments.append((kind, value))
 
-        try:
-            msg = self._build_mime(recipients, subject, body, attachments)
-        except Exception as e:
-            logger.error(f"构建邮件失败: {e}")
-            return self._send_text(event, f"❌ 构建邮件失败: {e}")
+        channel = str(self.config.get("send_channel", "smtp")).strip().lower()
+        if channel != "agently":
+            channel = "smtp"
 
         self._send_lock = True
         try:
-            failed = await asyncio.to_thread(self._send_sync, msg, max_mb)
+            if channel == "agently":
+                max_mb = min(max_mb, max(1, self._int_cfg("agently_attach_max_mb", 20)))
+                failed = await asyncio.to_thread(
+                    self._send_agently_sync, recipients, subject, body, attachments, max_mb
+                )
+            else:
+                try:
+                    msg = self._build_mime(recipients, subject, body, attachments)
+                except Exception as e:
+                    logger.error(f"构建邮件失败: {e}")
+                    return self._send_text(event, f"❌ 构建邮件失败: {e}")
+                failed = await asyncio.to_thread(self._send_sync, msg, max_mb)
         except Exception as e:
             logger.error(f"发送邮件失败: {e}")
             return self._send_text(event, f"❌ 发送失败: {e}")
@@ -368,7 +495,12 @@ class SendMailPlugin(Star):
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "to": recipients,
             "subject": subject,
-            "from": str(self.config.get("smtp_user", "")).strip(),
+            "from": (
+                str(self.config.get("smtp_user", "")).strip()
+                if channel == "smtp"
+                else "agently-cli"
+            ),
+            "channel": channel,
             "attachments": [a[1] for a in attachments],
         })
 
