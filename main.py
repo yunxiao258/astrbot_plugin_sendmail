@@ -35,8 +35,8 @@ from astrbot.api.star import Context, Star, register
 
 PLUGIN_NAME = "astrbot_plugin_sendmail"
 PLUGIN_AUTHOR = "云晓"
-PLUGIN_DESC = "邮件发送助手：管理员按命令或让 AI 调用工具发送邮件"
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_DESC = "邮件助手：管理员让 AI 发送/读取邮件"
+PLUGIN_VERSION = "1.2.0"
 
 # 邮件服务商预设：provider -> (host, port, ssl)
 SMTP_PRESETS = {
@@ -70,7 +70,8 @@ HELP_TEXT = (
     "发送通道：smtp（SMTP 授权码）/ agently（Agent Mail CLI）\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "AI 联动：对 AI 说「帮我发邮件到 xxx，主题 yyy，内容 zzz」\n"
-    "即会由 AI 调用 send_mail 工具自动发送（同样仅管理员生效）"
+    "即会由 AI 调用 send_mail 工具自动发送；说「看看我的邮件」\n"
+    "AI 会调用 read_mail 工具读取邮箱并总结（均仅管理员生效）"
 )
 
 
@@ -443,6 +444,41 @@ class SendMailPlugin(Star):
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
+    def _agently_cli_run(self, args: list[str], timeout: int = 60) -> dict:
+        """执行 Agent Mail CLI 并解析 JSON 输出（供邮件读取等操作使用）"""
+        cmd = self._agently_cmd() + args
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=timeout
+            )
+        except FileNotFoundError:
+            raise RuntimeError(self._agently_missing_hint())
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"❌ Agent Mail CLI 执行超时（{timeout} 秒），请重试")
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if proc.returncode != 0:
+            raise RuntimeError(f"❌ Agent Mail CLI 执行失败: {err or out or f'exit {proc.returncode}'}")
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"❌ Agent Mail CLI 返回异常: {out[:200] or err[:200] or '无输出'}")
+        if not data.get("ok", True):
+            raise RuntimeError(
+                f"❌ Agent Mail CLI 执行失败: {data.get('message') or data.get('error') or data}"
+            )
+        return data
+
+    @staticmethod
+    def _mail_text(body_html: str, max_chars: int = 500) -> str:
+        """邮件 HTML 正文转纯文本（去标签、反转义、压缩空白、截断）"""
+        text = re.sub(r"<[^>]+>", " ", body_html or "")
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > max_chars:
+            text = text[:max_chars] + "…"
+        return text
+
     # ==================== 指令 ====================
 
     def _send_text(self, event: AstrMessageEvent, text: str):
@@ -581,6 +617,65 @@ class SendMailPlugin(Star):
             return "❌ 收件人无效，请提供有效的邮箱地址。"
         specs = [a.strip() for a in attachments.split(",") if a.strip()] if attachments else []
         return await self._dispatch_send(event, recipients, subject, body, specs)
+
+    @llm_tool(name="read_mail")
+    async def ai_read_mail(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+        limit: int = 5,
+        include_body: bool = False,
+    ):
+        """读取 Agent Mail 邮箱中的邮件，供 AI 总结汇报（仅管理员可用）。
+
+        Args:
+            query(string): 搜索关键词，可选；在主题与正文中检索，留空则列出收件箱最新邮件
+            limit(number): 返回邮件条数，1-10
+            include_body(boolean): 是否同时读取邮件正文，默认 false 只返回标题与摘要
+        """
+        if not event.is_admin():
+            return "❌ 仅管理员可以使用邮件读取功能。"
+        limit = max(1, min(int(limit or 5), 10))
+        if include_body:
+            limit = min(limit, 5)  # 避免超出 CLI 每分钟请求配额
+        try:
+            if (query or "").strip():
+                data = await asyncio.to_thread(
+                    self._agently_cli_run,
+                    ["message", "+search", "--q", query.strip(), "--limit", str(limit)],
+                )
+            else:
+                data = await asyncio.to_thread(
+                    self._agently_cli_run,
+                    ["message", "+list", "--dir", "inbox", "--limit", str(limit)],
+                )
+        except Exception as e:
+            return f"❌ 读取邮件失败: {e}"
+
+        items = (((data or {}).get("data") or {}).get("data")) or []
+        if not items:
+            return "📭 邮箱中没有找到相关邮件。"
+
+        lines: list[str] = []
+        for i, it in enumerate(items, 1):
+            subject = it.get("subject") or "(无主题)"
+            frm = (it.get("from") or {}).get("email") or "?"
+            created = (it.get("created_at") or "")[:16].replace("T", " ")
+            snippet = (it.get("snippet") or "").strip()
+            lines.append(f"{i}. {subject}\n   发件人: {frm}  时间: {created}")
+            mid = it.get("message_id")
+            if include_body and mid:
+                try:
+                    full = await asyncio.to_thread(
+                        self._agently_cli_run, ["message", "+read", "--id", mid]
+                    )
+                    body = ((full or {}).get("data") or {}).get("body") or ""
+                    lines.append(f"   正文: {self._mail_text(body)}")
+                except Exception as e:
+                    lines.append(f"   正文读取失败: {e}")
+            elif snippet:
+                lines.append(f"   摘要: {snippet}")
+        return f"📬 邮箱邮件（{len(items)} 封）:\n" + "\n".join(lines)
 
 
 class _UrlPlaceholder:

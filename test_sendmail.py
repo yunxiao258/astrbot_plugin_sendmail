@@ -454,6 +454,103 @@ class TestAiTool(unittest.TestCase):
         self.assertEqual(p._history[0]["attachments"], [])
 
 
+# ==================== AI 工具（read_mail） ====================
+
+def fake_list_resp():
+    return {
+        "ok": True,
+        "data": {
+            "data": [
+                {
+                    "message_id": "msg_abc",
+                    "subject": "季度报告",
+                    "from": {"email": "boss@example.com", "name": "Boss"},
+                    "created_at": "2026-08-15T10:00:00Z",
+                    "snippet": "这是摘要内容",
+                }
+            ]
+        }
+    }
+
+
+class TestMailText(unittest.TestCase):
+    def test_html_to_plain_text(self):
+        self.assertEqual(
+            SendMailPlugin._mail_text("<p>你好<b>世界</b></p>"),
+            "你好 世界",  # 标签位置转换为空格
+        )
+
+    def test_truncated(self):
+        text = SendMailPlugin._mail_text("<p>" + "哈" * 600 + "</p>", max_chars=100)
+        self.assertEqual(len(text), 101)  # 100 字 + 省略号
+        self.assertTrue(text.endswith("…"))
+
+
+class TestAiReadMail(unittest.TestCase):
+    def test_non_admin_rejected(self):
+        p = make_plugin()
+        result = asyncio.run(p.ai_read_mail(FakeEvent(is_admin=False)))
+        self.assertIn("仅管理员", result)
+
+    def test_list_success(self):
+        p = make_plugin()
+        calls = []
+        p._agently_cli_run = lambda args, timeout=60: (calls.append(args) or fake_list_resp())
+        result = asyncio.run(p.ai_read_mail(FakeEvent(), limit=3))
+        self.assertIn("季度报告", result)
+        self.assertIn("boss@example.com", result)
+        self.assertEqual(calls[0][:4], ["message", "+list", "--dir", "inbox"])
+
+    def test_search_with_query(self):
+        p = make_plugin()
+        calls = []
+        p._agently_cli_run = lambda args, timeout=60: (calls.append(args) or fake_list_resp())
+        result = asyncio.run(p.ai_read_mail(FakeEvent(), query="报告"))
+        self.assertIn("季度报告", result)
+        self.assertEqual(calls[0][:4], ["message", "+search", "--q", "报告"])
+
+    def test_include_body_reads_full(self):
+        p = make_plugin()
+        read_calls = []
+
+        def fake_run(args, timeout=60):
+            if args[1] == "+read":
+                read_calls.append(args)
+                return {"ok": True, "data": {"body": "<p>正文内容<b>详情</b></p>"}}
+            return fake_list_resp()
+
+        p._agently_cli_run = fake_run
+        result = asyncio.run(p.ai_read_mail(FakeEvent(), include_body=True))
+        self.assertIn("正文: 正文内容 详情", result)
+        self.assertEqual(read_calls, [["message", "+read", "--id", "msg_abc"]])
+
+    def test_empty_result(self):
+        p = make_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": []}}
+        result = asyncio.run(p.ai_read_mail(FakeEvent()))
+        self.assertIn("没有找到相关邮件", result)
+
+    def test_cli_failure_reported(self):
+        p = make_plugin()
+
+        def boom(args, timeout=60):
+            raise RuntimeError("CLI 未安装")
+
+        p._agently_cli_run = boom
+        result = asyncio.run(p.ai_read_mail(FakeEvent()))
+        self.assertIn("读取邮件失败", result)
+
+    def test_include_body_limits_to_five(self):
+        p = make_plugin()
+        calls = []
+        p._agently_cli_run = lambda args, timeout=60: (
+            calls.append(args) or {"ok": True, "data": {"data": []}}
+        )
+        asyncio.run(p.ai_read_mail(FakeEvent(), limit=10, include_body=True))
+        self.assertIn("--limit", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--limit") + 1], "5")
+
+
 # ==================== Agent Mail CLI 通道 ====================
 
 class FakeProc:
