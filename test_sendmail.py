@@ -396,6 +396,64 @@ class TestCommand(unittest.TestCase):
             self.assertIn("已发送到", reply_text(result), cmd)
 
 
+# ==================== AI 工具（send_mail） ====================
+
+class TestAiTool(unittest.TestCase):
+    def test_non_admin_rejected(self):
+        p = make_plugin()
+        result = asyncio.run(p.ai_send_mail(
+            FakeEvent(is_admin=False), "a@b.com", "主题", "正文"
+        ))
+        self.assertIn("仅管理员", result)
+
+    def test_invalid_recipients(self):
+        p = make_plugin()
+        result = asyncio.run(p.ai_send_mail(
+            FakeEvent(), "不是邮箱", "主题", "正文"
+        ))
+        self.assertIn("收件人无效", result)
+
+    def test_success_smtp_channel(self):
+        p = make_plugin()
+        p._send_sync = lambda msg, max_mb: []
+        result = asyncio.run(p.ai_send_mail(
+            FakeEvent(), "a@b.com,c@d.com", "周报", "本周数据"
+        ))
+        self.assertIn("已发送到", result)
+        self.assertIn("a@b.com", result)
+        self.assertEqual(len(p._history), 1)
+        self.assertEqual(p._history[0]["channel"], "smtp")
+        self.assertEqual(p._history[0]["subject"], "周报")
+
+    def test_success_agently_channel(self):
+        p = make_plugin(send_channel="agently")
+        p._send_agently_sync = lambda *args: []
+        result = asyncio.run(p.ai_send_mail(
+            FakeEvent(), "a@b.com", "主题", "正文"
+        ))
+        self.assertIn("已发送到", result)
+        self.assertEqual(p._history[0]["channel"], "agently")
+
+    def test_attachments_parsed(self):
+        p = make_plugin()
+        p._send_sync = lambda msg, max_mb: []
+        result = asyncio.run(p.ai_send_mail(
+            FakeEvent(), "a@b.com", "主题", "正文",
+            attachments="https://x.com/a.pdf, https://y.com/b.png",
+        ))
+        self.assertIn("已发送到", result)
+        self.assertEqual(p._history[0]["attachments"], ["https://x.com/a.pdf", "https://y.com/b.png"])
+
+    def test_empty_attachments_ok(self):
+        p = make_plugin()
+        p._send_sync = lambda msg, max_mb: []
+        result = asyncio.run(p.ai_send_mail(
+            FakeEvent(), "a@b.com", "主题", "正文", attachments="  "
+        ))
+        self.assertIn("已发送到", result)
+        self.assertEqual(p._history[0]["attachments"], [])
+
+
 # ==================== Agent Mail CLI 通道 ====================
 
 class FakeProc:

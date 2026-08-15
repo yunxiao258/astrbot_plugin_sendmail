@@ -28,15 +28,15 @@ from email.utils import formataddr, formatdate
 
 import httpx
 
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_NAME = "astrbot_plugin_sendmail"
 PLUGIN_AUTHOR = "云晓"
-PLUGIN_DESC = "邮件发送助手：管理员按命令发送邮件"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_DESC = "邮件发送助手：管理员按命令或让 AI 调用工具发送邮件"
+PLUGIN_VERSION = "1.1.1"
 
 # 邮件服务商预设：provider -> (host, port, ssl)
 SMTP_PRESETS = {
@@ -67,7 +67,10 @@ HELP_TEXT = (
     "示例：/邮件 a@qq.com,b@163.com | 周报 | 本周数据见附件\n"
     "--附件=https://example.com/report.pdf\n"
     "正文包含 HTML 标签时按 HTML 渲染，普通文本自动转义。\n"
-    "发送通道：smtp（SMTP 授权码）/ agently（Agent Mail CLI）"
+    "发送通道：smtp（SMTP 授权码）/ agently（Agent Mail CLI）\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "AI 联动：对 AI 说「帮我发邮件到 xxx，主题 yyy，内容 zzz」\n"
+    "即会由 AI 调用 send_mail 工具自动发送（同样仅管理员生效）"
 )
 
 
@@ -441,6 +444,18 @@ class SendMailPlugin(Star):
                 "❌ 正文为空。用法: /邮件 收件人 | 主题 | 正文（正文允许包含 |）",
             )
 
+        msg = await self._dispatch_send(event, recipients, subject, body, attachments_spec)
+        return self._send_text(event, msg)
+
+    async def _dispatch_send(
+        self,
+        event: AstrMessageEvent,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        attachments_spec: list[str],
+    ) -> str:
+        """执行发送流程（校验、频率限制、通道分发、记录），返回结果文本；供命令与 LLM 工具共用。"""
         max_chars = max(100, self._int_cfg("body_max_chars", 5000))
         truncated = len(body) > max_chars
         if truncated:
@@ -450,11 +465,9 @@ class SendMailPlugin(Star):
         interval = max(1, self._int_cfg("send_interval", 30))
         wait = interval - (time.time() - self._last_send_at)
         if wait > 0:
-            return self._send_text(
-                event, f"⏳ 发送太频繁，请 {int(wait)} 秒后再试（send_interval={interval}s）。"
-            )
+            return f"⏳ 发送太频繁，请 {int(wait)} 秒后再试（send_interval={interval}s）。"
         if self._send_lock:
-            return self._send_text(event, "⏳ 正在发送上一封邮件，请稍候。")
+            return "⏳ 正在发送上一封邮件，请稍候。"
 
         max_mb = max(1, self._int_cfg("attach_max_mb", 10))
         attach_failed: list[str] = []
@@ -482,11 +495,11 @@ class SendMailPlugin(Star):
                     msg = self._build_mime(recipients, subject, body, attachments)
                 except Exception as e:
                     logger.error(f"构建邮件失败: {e}")
-                    return self._send_text(event, f"❌ 构建邮件失败: {e}")
+                    return f"❌ 构建邮件失败: {e}"
                 failed = await asyncio.to_thread(self._send_sync, msg, max_mb)
         except Exception as e:
             logger.error(f"发送邮件失败: {e}")
-            return self._send_text(event, f"❌ 发送失败: {e}")
+            return f"❌ 发送失败: {e}"
         finally:
             self._send_lock = False
             self._last_send_at = time.time()
@@ -511,7 +524,32 @@ class SendMailPlugin(Star):
             lines.append(f"⚠️ 附件无效已忽略: {', '.join(attach_failed)}")
         if failed:
             lines.append(f"⚠️ 以下附件下载失败: {', '.join(failed)}")
-        return self._send_text(event, "\n".join(lines))
+        return "\n".join(lines)
+
+    @llm_tool(name="send_mail")
+    async def ai_send_mail(
+        self,
+        event: AstrMessageEvent,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: str = "",
+    ):
+        """发送邮件到指定邮箱（仅管理员可用）。
+
+        Args:
+            to(string): 收件人邮箱地址，多个收件人用英文逗号分隔
+            subject(string): 邮件主题
+            body(string): 邮件正文，支持 HTML 标签
+            attachments(string): 附件地址，可选；多个附件用英文逗号分隔，每个附件为 URL 或服务器本地文件路径
+        """
+        if not event.is_admin():
+            return "❌ 仅管理员可以使用发送邮件功能。"
+        recipients = self._parse_recipients(to)
+        if not recipients:
+            return "❌ 收件人无效，请提供有效的邮箱地址。"
+        specs = [a.strip() for a in attachments.split(",") if a.strip()] if attachments else []
+        return await self._dispatch_send(event, recipients, subject, body, specs)
 
 
 class _UrlPlaceholder:
