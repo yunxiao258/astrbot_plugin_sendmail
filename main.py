@@ -116,6 +116,30 @@ class SendMailPlugin(Star):
         self._last_targets_warn: float = 0.0
         logger.info(f"【{PLUGIN_NAME}】邮件发送助手插件初始化完成")
 
+    # ==================== 定时任务生命周期 ====================
+
+    async def initialize(self) -> None:
+        """插件加载/重载时启动定时邮件检查任务"""
+        await self._start_mail_watcher()
+
+    @filter.on_astrbot_loaded()
+    async def _start_mail_watcher(self) -> None:
+        """启动定时邮件检查任务（幂等：重复调用不会重复启动）"""
+        if not self._bool_cfg("auto_summary_enabled", True):
+            logger.info("【sendmail】定时邮件总结已禁用")
+            return
+        if self._mail_watcher_task and not self._mail_watcher_task.done():
+            return
+        self._mail_watcher_task = asyncio.create_task(self._mail_watcher_loop())
+        self._mail_watcher_task.add_done_callback(
+            lambda t: (
+                logger.error(f"定时邮件总结任务异常退出: {t.exception()}")
+                if not t.cancelled() and t.exception()
+                else None
+            )
+        )
+        logger.info("【sendmail】定时邮件总结任务已启动")
+
     # ==================== 配置安全取值 ====================
 
     def _int_cfg(self, key: str, default: int) -> int:
@@ -688,24 +712,6 @@ class SendMailPlugin(Star):
 
     # ==================== 定时邮件总结推送 ====================
 
-    @filter.on_astrbot_loaded()
-    async def _start_mail_watcher(self) -> None:
-        """AstrBot 加载完成后启动定时邮件检查任务"""
-        if not self._bool_cfg("auto_summary_enabled", True):
-            logger.info("【sendmail】定时邮件总结已禁用")
-            return
-        if self._mail_watcher_task and not self._mail_watcher_task.done():
-            return
-        self._mail_watcher_task = asyncio.create_task(self._mail_watcher_loop())
-        self._mail_watcher_task.add_done_callback(
-            lambda t: (
-                logger.error(f"定时邮件总结任务异常退出: {t.exception()}")
-                if not t.cancelled() and t.exception()
-                else None
-            )
-        )
-        logger.info("【sendmail】定时邮件总结任务已启动")
-
     async def terminate(self) -> None:
         """插件停用/重载时取消定时任务"""
         if self._mail_watcher_task and not self._mail_watcher_task.done():
@@ -749,6 +755,14 @@ class SendMailPlugin(Star):
                 seen.add(t)
                 out.append(t)
         return out
+
+    @staticmethod
+    def _valid_target_umo(umo: str) -> bool:
+        """校验目标会话是否为合法的 unified_msg_origin（平台:消息类型:会话ID）"""
+        parts = umo.split(":", 2)
+        if len(parts) != 3 or not parts[0] or not parts[2]:
+            return False
+        return parts[1] in ("GroupMessage", "FriendMessage", "OtherMessage")
 
     async def _check_new_mails(self) -> None:
         """检查收件箱新邮件（按 message_id 去重），推送到配置目标会话"""
@@ -795,6 +809,14 @@ class SendMailPlugin(Star):
         new_items = new_items[:max_mails]
         seen.update(current_ids)
         self._save_seen_ids(seen)
+
+        targets = [t for t in targets if self._valid_target_umo(t)]
+        if not targets:
+            logger.warning(
+                "【sendmail】auto_summary_targets 无合法目标会话"
+                "（格式: 平台:GroupMessage/FriendMessage:会话ID，如 云晓:GroupMessage:群号）"
+            )
+            return
 
         text = await self._build_summary_text(new_items)
         chain = MessageChain([Plain(text)])
