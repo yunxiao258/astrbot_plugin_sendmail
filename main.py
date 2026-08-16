@@ -113,6 +113,7 @@ class SendMailPlugin(Star):
         )
         self._load_history()
         self._mail_watcher_task = None
+        self._last_targets_warn: float = 0.0
         logger.info(f"【{PLUGIN_NAME}】邮件发送助手插件初始化完成")
 
     # ==================== 配置安全取值 ====================
@@ -753,7 +754,13 @@ class SendMailPlugin(Star):
         """检查收件箱新邮件（按 message_id 去重），推送到配置目标会话"""
         targets = self._parse_targets(str(self.config.get("auto_summary_targets", "") or ""))
         if not targets:
-            logger.warning("【sendmail】auto_summary_targets 未配置，定时邮件总结不会推送")
+            # 未配置目标会话：每 10 分钟最多提醒一次，避免日志刷屏
+            if time.time() - self._last_targets_warn >= 600:
+                self._last_targets_warn = time.time()
+                logger.warning(
+                    "【sendmail】auto_summary_targets 未配置，定时邮件总结不会推送；"
+                    "请在插件配置中填写目标会话（如 云晓:GroupMessage:群号）后重载插件"
+                )
             return
 
         try:
