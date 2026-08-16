@@ -11,6 +11,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from astrbot.api.all import MessageChain
+from astrbot.api.message_components import Plain
+from astrbot.core.provider.entities import LLMResponse
+
 sys.path.insert(0, r"D:\astrbot\data\plugins")
 sys.path.insert(0, r"D:\astrbot\data\plugins\astrbot_plugin_sendmail")
 
@@ -114,6 +118,34 @@ def make_plugin(**overrides):
         p._history = p._history[-50:]
     p._append_history = append_mem
     return p
+
+
+class FakeContext:
+    """Star.context 替身：记录推送与 LLM provider"""
+
+    def __init__(self):
+        self.sent = []
+        self.provider = None
+
+    async def send_message(self, session, chain):
+        self.sent.append((session, "".join(getattr(c, "text", "") for c in chain.chain)))
+        return True
+
+    def get_using_provider(self, umo=None):
+        return self.provider
+
+
+class FakeProvider:
+    """LLM provider 替身：text_chat 返回固定总结或抛错"""
+
+    def __init__(self, result="这是 AI 总结", err=False):
+        self.result = result
+        self.err = err
+
+    async def text_chat(self, prompt=None, **kwargs):
+        if self.err:
+            raise RuntimeError("LLM 不可用")
+        return LLMResponse(role="assistant", result_chain=MessageChain([Plain(self.result)]))
 
 
 # ==================== 解析 ====================
@@ -764,6 +796,149 @@ class TestAgentlyCommand(unittest.TestCase):
         self.assertIn("已发送到", reply_text(result))
         self.assertEqual(calls, ["a@b.com"])
         self.assertEqual(p._history[0]["channel"], "smtp")
+
+
+# ==================== 定时邮件总结推送 ====================
+
+MAIL_ITEMS = [
+    {
+        "message_id": "msg_old1",
+        "subject": "旧邮件",
+        "from": {"email": "a@b.com"},
+        "created_at": "2026-08-15T09:00:00Z",
+        "snippet": "旧摘要",
+    },
+    {
+        "message_id": "msg_new1",
+        "subject": "新邮件一",
+        "from": {"email": "boss@example.com"},
+        "created_at": "2026-08-15T10:00:00Z",
+        "snippet": "新摘要一",
+    },
+]
+
+
+def make_watcher_plugin(**overrides):
+    """构造带临时 seen 文件与 fake context 的插件"""
+    cfg = {"auto_summary_enabled": True, "auto_summary_interval": 30,
+           "auto_summary_targets": "云晓:GroupMessage:1", "auto_summary_llm": True,
+           "auto_summary_max_mails": 5}
+    cfg.update(overrides)
+    p = make_plugin(**cfg)
+    p._seen_path = os.path.join(tempfile.mkdtemp(prefix="seen_"), "seen.json")
+    p.context = FakeContext()
+    return p
+
+
+class TestAutoSummary(unittest.TestCase):
+    def test_parse_targets(self):
+        p = make_plugin()
+        self.assertEqual(
+            p._parse_targets(" 云晓:GroupMessage:1, 凌阳:GroupMessage:2;云晓:GroupMessage:1"),
+            ["云晓:GroupMessage:1", "凌阳:GroupMessage:2"],
+        )
+        self.assertEqual(p._parse_targets("  ,,  "), [])
+
+    def test_no_targets_skips(self):
+        p = make_watcher_plugin(auto_summary_targets="")
+        p._agently_cli_run = lambda args, timeout=60: (_ for _ in ()).throw(
+            AssertionError("不应读取邮箱")
+        )
+        asyncio.run(p._check_new_mails())
+
+    def test_first_run_baseline_only(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        asyncio.run(p._check_new_mails())
+        self.assertEqual(p.context.sent, [])  # 首次不推送
+        with open(p._seen_path, encoding="utf-8") as f:
+            seen = set(json.load(f))
+        self.assertEqual(seen, {"msg_old1", "msg_new1"})
+
+    def test_new_mail_pushed(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p.context.provider = FakeProvider()
+        # 预置基线：只有旧邮件
+        p._save_seen_ids({"msg_old1"})
+        asyncio.run(p._check_new_mails())
+        self.assertEqual(len(p.context.sent), 1)
+        session, text = p.context.sent[0]
+        self.assertEqual(session, "云晓:GroupMessage:1")
+        self.assertIn("新邮件提醒（1 封）", text)
+        self.assertIn("新邮件一", text)
+        self.assertIn("boss@example.com", text)
+        self.assertIn("AI 总结", text)
+        self.assertIn("这是 AI 总结", text)
+        with open(p._seen_path, encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)), {"msg_old1", "msg_new1"})
+
+    def test_no_new_mail_silent(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1", "msg_new1"})
+        asyncio.run(p._check_new_mails())
+        self.assertEqual(p.context.sent, [])
+
+    def test_llm_failure_falls_back_to_detail(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        p.context.provider = FakeProvider(err=True)
+        asyncio.run(p._check_new_mails())
+        _, text = p.context.sent[0]
+        self.assertIn("新邮件一", text)
+        self.assertNotIn("AI 总结", text)
+
+    def test_llm_disabled(self):
+        p = make_watcher_plugin(auto_summary_llm=False)
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        asyncio.run(p._check_new_mails())
+        _, text = p.context.sent[0]
+        self.assertNotIn("AI 总结", text)
+
+    def test_llm_called_with_detail(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        seen_prompts = []
+
+        class Recorder(FakeProvider):
+            async def text_chat(self, prompt=None, **kwargs):
+                seen_prompts.append(prompt)
+                return await super().text_chat(prompt=prompt, **kwargs)
+
+        p.context.provider = Recorder()
+        asyncio.run(p._check_new_mails())
+        self.assertTrue(seen_prompts)
+        self.assertIn("新邮件一", seen_prompts[0])
+
+    def test_max_mails_limit(self):
+        many = MAIL_ITEMS + [
+            {"message_id": f"msg_new{i}", "subject": f"新邮件{i}",
+             "from": {"email": "x@y.com"}, "created_at": "2026-08-15T11:00:00Z",
+             "snippet": "摘要"}
+            for i in range(2, 7)
+        ]
+        p = make_watcher_plugin(auto_summary_max_mails=3)
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": many}}
+        p._save_seen_ids({"msg_old1"})
+        asyncio.run(p._check_new_mails())
+        self.assertEqual(len(p.context.sent), 1)
+        _, text = p.context.sent[0]
+        self.assertIn("新邮件提醒（3 封）", text)
+        self.assertNotIn("新邮件5", text)
+
+    def test_cli_failure_skips(self):
+        p = make_watcher_plugin()
+
+        def boom(args, timeout=60):
+            raise RuntimeError("网络错误")
+
+        p._agently_cli_run = boom
+        asyncio.run(p._check_new_mails())  # 不抛异常，静默跳过
+        self.assertEqual(p.context.sent, [])
 
 
 if __name__ == "__main__":

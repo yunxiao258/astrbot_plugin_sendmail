@@ -9,6 +9,7 @@
 - HTML 正文：正文含 HTML 标签时按 HTML 渲染，纯文本自动转义并保留换行
 - 双发送通道：SMTP（QQ/163/Gmail 授权码）与 Agent Mail（腾讯 Agent Mail CLI）
 - AI 联动：对 AI 说「帮我发邮件到 xxx，主题 yyy，内容 zzz」，AI 会调用 `send_mail` 工具自动发送；说「看看我的邮件」「帮我找下老板的邮件」等，AI 会调用 `read_mail` 工具读取收件箱并总结（均仅管理员生效）
+- 定时总结：按配置间隔轮询收件箱，新邮件自动推送到指定群/会话（LLM 总结 + 明细，按 message_id 去重）
 - 安全防护：仅管理员可用、发送频率限制、并发锁、发送历史日志
 
 ## 使用方法
@@ -64,6 +65,19 @@ AI 用法示例（对 AI 说）：
 | `send_interval` | 两次发送最小间隔（秒） | `30` |
 | `agently_attach_max_mb` | Agent Mail 通道附件上限（MB，服务端上限 20） | `20` |
 | `agently_cli_path` | agently-cli 可执行文件路径（留空自动在 PATH 中查找） | 空 |
+| `auto_summary_enabled` | 是否启用定时读取邮箱并自动总结推送 | `true` |
+| `auto_summary_interval` | 定时检查间隔（秒，最小 10） | `30` |
+| `auto_summary_targets` | 推送目标会话（unified_msg_origin，逗号分隔；留空不推送） | 空 |
+| `auto_summary_llm` | 是否用 LLM 生成总结（不可用时回退明细推送） | `true` |
+| `auto_summary_max_mails` | 每轮最多推送的新邮件数 | `5` |
+
+## 定时邮件总结
+
+插件按 `auto_summary_interval` 轮询收件箱（最新 50 封），按 **message_id 去重**：
+
+- 首次运行只建立基线（不推送历史邮件），之后的才算新邮件
+- 有新邮件时推送到 `auto_summary_targets` 指定的会话，内容含 AI 总结（`auto_summary_llm` 开启且 provider 可用时）+ 每封的主题/发件人/时间/摘要
+- 已读记录保存在 `plugin_data/astrbot_plugin_sendmail/seen_mail_ids.json`
 
 ## 发送通道
 

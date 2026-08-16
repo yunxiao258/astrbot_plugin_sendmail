@@ -68,5 +68,30 @@
     "description": "agently-cli 可执行文件路径（留空自动在 PATH 中查找）",
     "type": "string",
     "default": ""
+  },
+  "auto_summary_enabled": {
+    "description": "是否启用定时读取邮箱并自动总结推送（按配置间隔轮询收件箱，新邮件推送到 auto_summary_targets）",
+    "type": "bool",
+    "default": true
+  },
+  "auto_summary_interval": {
+    "description": "定时检查邮箱间隔（秒），最小 10 秒",
+    "type": "int",
+    "default": 30
+  },
+  "auto_summary_targets": {
+    "description": "推送目标会话列表，格式为 unified_msg_origin（如 云晓:GroupMessage:群号），多个用逗号分隔；留空则不推送",
+    "type": "string",
+    "default": ""
+  },
+  "auto_summary_llm": {
+    "description": "是否用 LLM 生成总结（可用时）；不可用时回退为主题+摘要明细推送",
+    "type": "bool",
+    "default": true
+  },
+  "auto_summary_max_mails": {
+    "description": "每轮最多推送的新邮件数（防刷屏）",
+    "type": "int",
+    "default": 5
   }
 }

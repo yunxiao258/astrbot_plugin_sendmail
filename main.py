@@ -29,14 +29,15 @@ from email.utils import formataddr, formatdate
 import httpx
 
 from astrbot.api import AstrBotConfig, llm_tool, logger
+from astrbot.api.all import MessageChain
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_NAME = "astrbot_plugin_sendmail"
 PLUGIN_AUTHOR = "云晓"
-PLUGIN_DESC = "邮件助手：管理员让 AI 发送/读取邮件"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_DESC = "邮件助手：管理员让 AI 发送/读取邮件，定时总结推送新邮件"
+PLUGIN_VERSION = "1.3.0"
 
 # 邮件服务商预设：provider -> (host, port, ssl)
 SMTP_PRESETS = {
@@ -90,7 +91,7 @@ def _file_part(name: str, data: bytes) -> MIMEApplication:
 
 
 class SendMailPlugin(Star):
-    """邮件发送助手：管理员按命令发送邮件"""
+    """邮件发送助手：管理员按命令发送邮件，AI 工具发送/读取，定时总结推送"""
 
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -104,7 +105,14 @@ class SendMailPlugin(Star):
             PLUGIN_NAME,
             "send_log.json",
         )
+        self._seen_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "plugin_data",
+            PLUGIN_NAME,
+            "seen_mail_ids.json",
+        )
         self._load_history()
+        self._mail_watcher_task = None
         logger.info(f"【{PLUGIN_NAME}】邮件发送助手插件初始化完成")
 
     # ==================== 配置安全取值 ====================
@@ -676,6 +684,159 @@ class SendMailPlugin(Star):
             elif snippet:
                 lines.append(f"   摘要: {snippet}")
         return f"📬 邮箱邮件（{len(items)} 封）:\n" + "\n".join(lines)
+
+    # ==================== 定时邮件总结推送 ====================
+
+    @filter.on_astrbot_loaded()
+    async def _start_mail_watcher(self) -> None:
+        """AstrBot 加载完成后启动定时邮件检查任务"""
+        if not self._bool_cfg("auto_summary_enabled", True):
+            logger.info("【sendmail】定时邮件总结已禁用")
+            return
+        if self._mail_watcher_task and not self._mail_watcher_task.done():
+            return
+        self._mail_watcher_task = asyncio.create_task(self._mail_watcher_loop())
+        self._mail_watcher_task.add_done_callback(
+            lambda t: (
+                logger.error(f"定时邮件总结任务异常退出: {t.exception()}")
+                if not t.cancelled() and t.exception()
+                else None
+            )
+        )
+        logger.info("【sendmail】定时邮件总结任务已启动")
+
+    async def terminate(self) -> None:
+        """插件停用/重载时取消定时任务"""
+        if self._mail_watcher_task and not self._mail_watcher_task.done():
+            self._mail_watcher_task.cancel()
+            self._mail_watcher_task = None
+
+    async def _mail_watcher_loop(self) -> None:
+        """定时轮询收件箱，发现新邮件推送到配置目标"""
+        while True:
+            try:
+                await self._check_new_mails()
+            except Exception as e:
+                logger.error(f"定时检查邮件失败: {e}")
+            interval = max(10, self._int_cfg("auto_summary_interval", 30))
+            await asyncio.sleep(interval)
+
+    def _load_seen_ids(self) -> set[str]:
+        try:
+            with open(self._seen_path, encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data) if isinstance(data, list) else set()
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return set()
+
+    def _save_seen_ids(self, ids: set[str]) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._seen_path), exist_ok=True)
+            with open(self._seen_path, "w", encoding="utf-8") as f:
+                json.dump(sorted(ids), f, ensure_ascii=False)
+        except OSError as e:
+            logger.error(f"保存已读邮件记录失败: {e}")
+
+    @staticmethod
+    def _parse_targets(raw: str) -> list[str]:
+        """解析推送目标会话（unified_msg_origin，逗号/分号分隔，去空白去重）"""
+        seen: set[str] = set()
+        out: list[str] = []
+        for t in re.split(r"[,，;；]+", raw or ""):
+            t = t.strip()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    async def _check_new_mails(self) -> None:
+        """检查收件箱新邮件（按 message_id 去重），推送到配置目标会话"""
+        targets = self._parse_targets(str(self.config.get("auto_summary_targets", "") or ""))
+        if not targets:
+            logger.warning("【sendmail】auto_summary_targets 未配置，定时邮件总结不会推送")
+            return
+
+        try:
+            data = await asyncio.to_thread(
+                self._agently_cli_run,
+                ["message", "+list", "--dir", "inbox", "--limit", "50"],
+            )
+        except Exception as e:
+            logger.warning(f"【sendmail】读取收件箱失败: {e}")
+            return
+
+        items = (((data or {}).get("data") or {}).get("data")) or []
+        if not items:
+            return
+
+        current_ids = {it.get("message_id") for it in items if it.get("message_id")}
+        if not current_ids:
+            return
+
+        seen = self._load_seen_ids()
+        if not seen:
+            # 首次运行：只记录基线，不推送历史邮件
+            self._save_seen_ids(current_ids)
+            logger.info(f"【sendmail】已建立邮件基线（{len(current_ids)} 封），后续新邮件将推送")
+            return
+
+        new_items = [it for it in items if it.get("message_id") and it.get("message_id") not in seen]
+        if not new_items:
+            return
+
+        max_mails = max(1, min(self._int_cfg("auto_summary_max_mails", 5), 10))
+        new_items = new_items[:max_mails]
+        seen.update(current_ids)
+        self._save_seen_ids(seen)
+
+        text = await self._build_summary_text(new_items)
+        chain = MessageChain([Plain(text)])
+        for target in targets:
+            try:
+                await self.context.send_message(target, chain)
+            except Exception as e:
+                logger.error(f"【sendmail】推送到 {target} 失败: {e}")
+        logger.info(f"【sendmail】已推送 {len(new_items)} 封新邮件总结到 {len(targets)} 个会话")
+
+    async def _build_summary_text(self, items: list[dict]) -> str:
+        """构造推送文本：LLM 总结（可用时）+ 每封邮件明细"""
+        lines: list[str] = [f"📬 新邮件提醒（{len(items)} 封）"]
+        detail: list[str] = []
+        for i, it in enumerate(items, 1):
+            subject = it.get("subject") or "(无主题)"
+            frm = (it.get("from") or {}).get("email") or "?"
+            created = (it.get("created_at") or "")[:16].replace("T", " ")
+            snippet = (it.get("snippet") or "").strip()
+            detail.append(f"【{i}】{subject}\n   发件人: {frm}  时间: {created}\n   摘要: {snippet or '（无摘要）'}")
+
+        if self._bool_cfg("auto_summary_llm", True):
+            try:
+                summary = await self._llm_summary(detail)
+                if summary:
+                    lines.append(f"🤖 AI 总结:\n{summary}\n")
+            except Exception as e:
+                logger.warning(f"【sendmail】LLM 总结失败，回退明细推送: {e}")
+        lines.extend(detail)
+        return "\n".join(lines)
+
+    async def _llm_summary(self, detail: list[str]) -> str:
+        """调用 AstrBot 当前聊天 provider 生成邮件总结"""
+        if not self.context:
+            raise RuntimeError("context 未初始化")
+        prov = self.context.get_using_provider()
+        if prov is None:
+            raise RuntimeError("未找到可用的 LLM provider")
+        prompt = (
+            "你是邮件助手。请将下面的新邮件内容总结成一段简洁的中文总结"
+            "（要点式亦可），不要遗漏发件人与主题信息：\n\n"
+            + "\n".join(detail)
+        )
+        resp = await asyncio.wait_for(prov.text_chat(prompt=prompt), timeout=60)
+        chain = getattr(resp, "result_chain", None)
+        text = "".join(getattr(c, "text", "") for c in (chain.chain if chain else [])).strip()
+        if getattr(resp, "role", "") == "err":
+            raise RuntimeError(text or "LLM 返回错误")
+        return text
 
 
 class _UrlPlaceholder:
