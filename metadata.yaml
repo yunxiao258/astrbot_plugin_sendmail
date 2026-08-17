@@ -2,6 +2,6 @@ name: astrbot_plugin_sendmail
 display_name: 邮件发送助手
 desc: 管理员让 AI 发送/读取邮件，定时总结推送新邮件：SMTP 或 Agent Mail CLI（agent.qq.com）双通道，支持多收件人、HTML 正文、URL/本地附件
 help: "发送「/邮件 收件人 | 主题 | 正文」；收件人多个用逗号分隔；正文后追加「--附件=链接或路径,多个逗号分隔」携带附件；「/邮件 帮助」查看用法。对 AI 说「帮我发邮件/看看我的邮件」由 AI 调用工具完成；新邮件会按配置定时总结推送到目标会话。仅管理员可用。"
-version: 1.3.0
+version: 1.4.0
 author: 云晓
 repo: https://github.com/yunxiao258/astrbot_plugin_sendmail

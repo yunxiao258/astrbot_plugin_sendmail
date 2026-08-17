@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """sendmail 插件单元测试：命令解析、MIME 构建、发送流程、权限与频率限制"""
 import asyncio
+import datetime
 import json
 import os
 import shutil
@@ -19,11 +20,14 @@ sys.path.insert(0, r"D:\astrbot\data\plugins")
 sys.path.insert(0, r"D:\astrbot\data\plugins\astrbot_plugin_sendmail")
 
 from astrbot_plugin_sendmail.main import (  # noqa: E402
+    MAIL_TEMPLATES,
     SMTP_PRESETS,
     SendMailPlugin,
     _UrlPlaceholder,
     _to_html,
+    render_template,
 )
+from astrbot_plugin_sendmail.mail_templates import render_text  # noqa: E402
 
 
 class FakeEvent:
@@ -939,6 +943,418 @@ class TestAutoSummary(unittest.TestCase):
         p._agently_cli_run = boom
         asyncio.run(p._check_new_mails())  # 不抛异常，静默跳过
         self.assertEqual(p.context.sent, [])
+
+
+# ==================== 转发规则匹配 ====================
+
+def make_rule(**kw):
+    """构造规则字典（默认启用、无条件）"""
+    base = {"id": "r1", "from_contains": "", "subject_contains": "",
+            "folder": "", "action_to": "fwd@example.com", "enabled": True}
+    base.update(kw)
+    return base
+
+
+class TestRuleMatching(unittest.TestCase):
+    def setUp(self):
+        self.p = make_plugin()
+
+    def test_from_contains_match(self):
+        rule = make_rule(from_contains="boss@")
+        mail = {"subject": "周报", "from": {"email": "boss@example.com", "name": "Boss"}}
+        self.assertTrue(self.p._rule_matches(rule, mail))
+
+    def test_from_contains_no_match(self):
+        rule = make_rule(from_contains="ceo@")
+        mail = {"subject": "周报", "from": {"email": "boss@example.com"}}
+        self.assertFalse(self.p._rule_matches(rule, mail))
+
+    def test_from_matches_name(self):
+        # 发件人条件对显示名也生效
+        rule = make_rule(from_contains="老板")
+        mail = {"subject": "x", "from": {"email": "boss@example.com", "name": "老板"}}
+        self.assertTrue(self.p._rule_matches(rule, mail))
+
+    def test_subject_contains_match(self):
+        rule = make_rule(subject_contains="报销")
+        mail = {"subject": "本季度报销单", "from": {"email": "a@b.com"}}
+        self.assertTrue(self.p._rule_matches(rule, mail))
+
+    def test_folder_match(self):
+        rule = make_rule(folder="inbox")
+        self.assertTrue(self.p._rule_matches(rule, {"subject": "x", "folder": "inbox"}))
+        self.assertFalse(self.p._rule_matches(rule, {"subject": "x", "folder": "spam"}))
+
+    def test_any_condition_matches(self):
+        # 发件人不中但主题中：任一命中即匹配
+        rule = make_rule(from_contains="nobody@", subject_contains="会议")
+        mail = {"subject": "会议通知", "from": {"email": "boss@x.com"}}
+        self.assertTrue(self.p._rule_matches(rule, mail))
+
+    def test_no_condition_never_matches(self):
+        rule = make_rule(from_contains="", subject_contains="", folder="")
+        self.assertFalse(self.p._rule_matches(rule, {"subject": "任意"}))
+
+    def test_disabled_never_matches(self):
+        rule = make_rule(from_contains="boss@", enabled=False)
+        mail = {"subject": "x", "from": {"email": "boss@example.com"}}
+        self.assertFalse(self.p._rule_matches(rule, mail))
+
+    def test_case_insensitive(self):
+        rule = make_rule(from_contains="BOSS")
+        mail = {"subject": "x", "from": {"email": "boss@example.com"}}
+        self.assertTrue(self.p._rule_matches(rule, mail))
+
+
+# ==================== 转发规则持久化（独立 JSON 原子写） ====================
+
+class TestRulePersistence(unittest.TestCase):
+    def setUp(self):
+        self.p = make_plugin()
+        self.p._rules_path = os.path.join(tempfile.mkdtemp(prefix="rules_"), "forward_rules.json")
+        self.p._rules = self.p._load_rules()
+
+    def test_add_and_persist_atomic(self):
+        text = self.p._cmd_rule("add 发件人=boss@ 主题=报销 转发=backup@example.com")
+        self.assertIn("已添加", text)
+        self.assertTrue(os.path.exists(self.p._rules_path))
+        with open(self.p._rules_path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(len(data["rules"]), 1)
+        r = data["rules"][0]
+        self.assertEqual(r["from_contains"], "boss@")
+        self.assertEqual(r["subject_contains"], "报销")
+        self.assertEqual(r["action_to"], "backup@example.com")
+        # 原子写：无残留临时文件
+        self.assertFalse(os.path.exists(self.p._rules_path + ".tmp"))
+
+    def test_invalid_target_rejected(self):
+        text = self.p._cmd_rule("add 发件人=boss@ 转发=不是邮箱")
+        self.assertIn("目标邮箱无效", text)
+        self.assertEqual(self.p._rules, [])
+
+    def test_no_condition_rejected(self):
+        text = self.p._cmd_rule("add 转发=backup@example.com")
+        self.assertIn("至少需要一个条件", text)
+        self.assertEqual(self.p._rules, [])
+
+    def test_list_and_remove(self):
+        self.p._cmd_rule("add 发件人=a@ 转发=b@example.com")
+        self.p._cmd_rule("add 主题=报销 转发=c@example.com")
+        listing = self.p._cmd_rule("list")
+        self.assertIn("转发规则", listing)
+        self.assertIn("b@example.com", listing)
+        rid = self.p._rules[0]["id"]
+        self.assertIn("已删除", self.p._cmd_rule(f"remove {rid}"))
+        self.assertEqual(len(self.p._rules), 1)
+        with open(self.p._rules_path, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["rules"]), 1)
+        # 删除不存在的 ID
+        self.assertIn("未找到", self.p._cmd_rule(f"remove {rid}"))
+
+    def test_load_missing_file_empty(self):
+        self.assertEqual(self.p._load_rules(), [])
+
+    def test_load_corrupt_file_empty(self):
+        with open(self.p._rules_path, "w", encoding="utf-8") as f:
+            f.write("{corrupt")
+        self.assertEqual(self.p._load_rules(), [])
+
+    def test_rule_commands_via_cmd_mail(self):
+        result = asyncio.run(self.p.cmd_mail(FakeEvent("/邮件 rule add 发件人=boss@ 转发=backup@example.com")))
+        self.assertIn("已添加", reply_text(result))
+        self.assertEqual(len(self.p._rules), 1)
+        result = asyncio.run(self.p.cmd_mail(FakeEvent("/邮件 rule list")))
+        self.assertIn("boss@", reply_text(result))
+        rid = self.p._rules[0]["id"]
+        result = asyncio.run(self.p.cmd_mail(FakeEvent(f"/邮件 rule remove {rid}")))
+        self.assertIn("已删除", reply_text(result))
+        self.assertEqual(self.p._rules, [])
+        result = asyncio.run(self.p.cmd_mail(FakeEvent("/邮件 rule")))
+        self.assertIn("转发规则用法", reply_text(result))
+
+
+# ==================== 转发流程 ====================
+
+class TestForwardFlow(unittest.TestCase):
+    def test_build_forward_body(self):
+        body = SendMailPlugin._build_forward_body({
+            "subject": "季度报告",
+            "from": {"email": "boss@example.com", "name": "Boss"},
+            "created_at": "2026-08-15T10:00:00Z",
+            "snippet": "这是摘要内容",
+        })
+        self.assertIn("boss@example.com", body)
+        self.assertIn("季度报告", body)
+        self.assertIn("2026-08-15 10:00", body)
+        self.assertIn("这是摘要内容", body)
+
+    def test_forward_in_check_new_mails(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        p._rules = [make_rule(subject_contains="新邮件")]
+        fwd = []
+        p._forward_one_sync = lambda item, to: fwd.append((to, item["subject"]))
+        asyncio.run(p._check_new_mails())
+        self.assertEqual(fwd, [("fwd@example.com", "新邮件一")])
+        # 推送流程不受影响
+        self.assertEqual(len(p.context.sent), 1)
+
+    def test_no_match_keeps_original_flow(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        p._rules = [make_rule(from_contains="不匹配的")]
+        fwd = []
+        p._forward_one_sync = lambda item, to: fwd.append(to)
+        asyncio.run(p._check_new_mails())
+        self.assertEqual(fwd, [])
+        self.assertEqual(len(p.context.sent), 1)
+
+    def test_forward_failure_does_not_crash(self):
+        p = make_watcher_plugin()
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        p._rules = [make_rule(subject_contains="新邮件")]
+
+        def boom(item, to):
+            raise RuntimeError("SMTP 认证失败")
+
+        p._forward_one_sync = boom
+        asyncio.run(p._check_new_mails())  # 不崩溃
+        self.assertEqual(len(p.context.sent), 1)  # 推送照常
+
+
+# ==================== 定时摘要调度 ====================
+
+class TestSummarySchedule(unittest.TestCase):
+    def setUp(self):
+        self.p = make_plugin()
+
+    def test_daily_next_today(self):
+        # 08:00 未到 09:00 -> 当天 09:00
+        now = datetime.datetime(2026, 8, 17, 8, 0)
+        self.assertEqual(self.p._next_summary_at(now), datetime.datetime(2026, 8, 17, 9, 0))
+
+    def test_daily_next_tomorrow(self):
+        # 10:00 已过 09:00 -> 明天 09:00
+        now = datetime.datetime(2026, 8, 17, 10, 0)
+        self.assertEqual(self.p._next_summary_at(now), datetime.datetime(2026, 8, 18, 9, 0))
+
+    def test_daily_custom_time(self):
+        p = make_plugin(summary_schedule_time="14:30")
+        now = datetime.datetime(2026, 8, 17, 13, 0)
+        self.assertEqual(p._next_summary_at(now), datetime.datetime(2026, 8, 17, 14, 30))
+
+    def test_weekly_same_day(self):
+        # 2026-08-17 是周一，配置周一 09:00，08:00 未到点 -> 当天
+        p = make_plugin(summary_schedule_mode="weekly", summary_schedule_weekday=1)
+        now = datetime.datetime(2026, 8, 17, 8, 0)
+        self.assertEqual(p._next_summary_at(now), datetime.datetime(2026, 8, 17, 9, 0))
+
+    def test_weekly_next_week(self):
+        # 周一已过 09:00 -> 下周一
+        p = make_plugin(summary_schedule_mode="weekly", summary_schedule_weekday=1)
+        now = datetime.datetime(2026, 8, 17, 10, 0)
+        self.assertEqual(p._next_summary_at(now), datetime.datetime(2026, 8, 24, 9, 0))
+
+    def test_weekly_other_day(self):
+        # 周三触发，周一 08:00 -> 本周三
+        p = make_plugin(summary_schedule_mode="weekly", summary_schedule_weekday=3)
+        now = datetime.datetime(2026, 8, 17, 8, 0)
+        self.assertEqual(p._next_summary_at(now), datetime.datetime(2026, 8, 19, 9, 0))
+
+    def test_dirty_time_falls_back(self):
+        p = make_plugin(summary_schedule_time="abc", summary_schedule_mode="乱七八糟")
+        now = datetime.datetime(2026, 8, 17, 8, 0)
+        self.assertEqual(p._next_summary_at(now), datetime.datetime(2026, 8, 17, 9, 0))
+
+
+# ==================== 定时摘要推送（复用 seen 去重） ====================
+
+class TestScheduledSummaryPush(unittest.TestCase):
+    def test_push_new_and_mark_seen(self):
+        p = make_watcher_plugin(summary_targets="云晓:GroupMessage:1")
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        text = asyncio.run(p._run_scheduled_summary(manual=True))
+        self.assertIn("已将 1 封新邮件摘要推送到 1 个会话", text)
+        self.assertIn("新邮件一", text)
+        self.assertEqual(len(p.context.sent), 1)
+        with open(p._seen_path, encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)), {"msg_old1", "msg_new1"})
+
+    def test_no_new_mail_no_push(self):
+        p = make_watcher_plugin(summary_targets="云晓:GroupMessage:1")
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1", "msg_new1"})
+        text = asyncio.run(p._run_scheduled_summary(manual=True))
+        self.assertIn("没有新邮件", text)
+        self.assertEqual(p.context.sent, [])
+
+    def test_no_targets_rejected(self):
+        p = make_watcher_plugin(summary_targets="")
+        text = asyncio.run(p._run_scheduled_summary(manual=True))
+        self.assertIn("summary_targets", text)
+
+    def test_invalid_targets_filtered(self):
+        p = make_watcher_plugin(summary_targets="不是合法目标")
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        text = asyncio.run(p._run_scheduled_summary(manual=True))
+        self.assertIn("summary_targets", text)
+        self.assertEqual(p.context.sent, [])
+
+    def test_first_run_baseline_only(self):
+        p = make_watcher_plugin(summary_targets="云晓:GroupMessage:1")
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        text = asyncio.run(p._run_scheduled_summary(manual=True))
+        self.assertIn("没有新邮件", text)  # 基线不推送
+        self.assertEqual(p.context.sent, [])
+        with open(p._seen_path, encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)), {"msg_old1", "msg_new1"})
+
+    def test_manual_summary_command(self):
+        p = make_watcher_plugin(summary_targets="云晓:GroupMessage:1")
+        p._agently_cli_run = lambda args, timeout=60: {"ok": True, "data": {"data": MAIL_ITEMS}}
+        p._save_seen_ids({"msg_old1"})
+        p.context.provider = FakeProvider()
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 summary now")))
+        text = reply_text(result)
+        self.assertIn("已将 1 封新邮件摘要推送到 1 个会话", text)
+        self.assertIn("新邮件一", text)
+        # summary 用法提示
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 summary")))
+        self.assertIn("定时摘要推送用法", reply_text(result))
+
+
+# ==================== 模板渲染 ====================
+
+class TestTemplateRender(unittest.TestCase):
+    def test_builtin_at_least_five(self):
+        self.assertGreaterEqual(len(MAIL_TEMPLATES), 5)
+        for name in ("请假申请", "周报提交", "生日祝福", "会议通知", "感谢信"):
+            self.assertIn(name, MAIL_TEMPLATES)
+
+    def test_render_success(self):
+        tpl = MAIL_TEMPLATES["请假申请"]
+        subject, body = render_template(tpl, {
+            "名字": "张三", "领导称呼": "王经理", "原因": "家中有事",
+            "天数": "1", "日期": "2026-08-18", "同事": "李四",
+        })
+        self.assertIn("请假申请 - 张三 - 2026-08-18", subject)
+        self.assertIn("尊敬的王经理", body)
+        self.assertIn("张三", body)
+        self.assertNotIn("{", body)  # 全部占位符已替换
+
+    def test_missing_placeholder_replaced_empty(self):
+        # 渲染层：缺失占位符替换为空串（命令层会提前拦截缺失项）
+        tpl = MAIL_TEMPLATES["生日祝福"]
+        subject, body = render_template(tpl, {"名字": "小红", "祝愿": "万事如意"})
+        self.assertIn("生日快乐，小红！", subject)
+        self.assertIn("万事如意", body)
+
+    def test_only_whitelisted_placeholders_replaced(self):
+        # 白名单外的 {占位符} 原样保留，不被替换
+        out = render_text("你好 {名字} {不存在的}", ["名字"], {"名字": "张三", "不存在的": "x"})
+        self.assertEqual(out, "你好 张三 {不存在的}")
+
+    def test_format_injection_safe(self):
+        # 恶意值尝试访问对象属性：str.replace 仅作字面量处理，不会求值
+        tpl = MAIL_TEMPLATES["感谢信"]
+        subject, body = render_template(tpl, {
+            "名字": "{0.__class__}", "事件": "x", "感谢内容": "y",
+            "署名": "z", "日期": "d",
+        })
+        self.assertIn("{0.__class__}", subject)  # 原样保留，未发生属性访问
+        self.assertIn("{0.__class__}", body)
+
+    def test_unknown_keys_ignored(self):
+        tpl = MAIL_TEMPLATES["生日祝福"]
+        subject, body = render_template(tpl, {
+            "名字": "小红", "祝愿": "好", "署名": "我", "__class__": "注入",
+        })
+        self.assertNotIn("注入", subject + body)
+
+
+# ==================== 模板命令 ====================
+
+class TestTemplateCommand(unittest.TestCase):
+    def test_template_list(self):
+        p = make_plugin()
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 template list")))
+        text = reply_text(result)
+        self.assertIn("邮件模板", text)
+        self.assertIn("请假申请", text)
+        self.assertIn("占位符", text)
+
+    def test_template_unknown(self):
+        p = make_plugin()
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 template 不存在的模板")))
+        self.assertIn("不存在", reply_text(result))
+
+    def test_send_template_success(self):
+        p = make_plugin()
+        sent = {}
+
+        def fake_send(msg, max_mb):
+            sent["to"] = msg["To"]
+            sent["subject"] = str(msg["Subject"])
+            return []
+
+        p._send_sync = fake_send
+        result = asyncio.run(p.cmd_mail(FakeEvent(
+            "/邮件 send 生日祝福 a@b.com 名字=小红 祝愿=万事如意 署名=小李"
+        )))
+        text = reply_text(result)
+        self.assertIn("已发送到", text)
+        self.assertIn("生日快乐，小红！", sent["subject"])
+        self.assertEqual(sent["to"], "a@b.com")
+        self.assertEqual(len(p._history), 1)
+
+    def test_send_template_unknown_template(self):
+        p = make_plugin()
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 send 不存在的模板 a@b.com 名字=x")))
+        self.assertIn("不存在", reply_text(result))
+
+    def test_send_template_invalid_recipient(self):
+        p = make_plugin()
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 send 生日祝福 不是邮箱 名字=x 祝愿=y 署名=z")))
+        self.assertIn("收件人无效", reply_text(result))
+
+    def test_send_template_missing_placeholder(self):
+        p = make_plugin()
+        p._send_sync = lambda msg, max_mb: []
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 send 生日祝福 a@b.com 名字=小红")))
+        text = reply_text(result)
+        self.assertIn("缺少模板占位符", text)
+        self.assertIn("祝愿", text)
+        self.assertIn("署名", text)
+
+    def test_send_template_smtp_failure_reported(self):
+        p = make_plugin()
+
+        def boom(msg, max_mb):
+            raise RuntimeError("smtp 认证失败")
+
+        p._send_sync = boom
+        result = asyncio.run(p.cmd_mail(FakeEvent(
+            "/邮件 send 生日祝福 a@b.com 名字=小红 祝愿=好 署名=我"
+        )))
+        self.assertIn("发送失败", reply_text(result))
+
+    def test_send_template_no_args_shows_help(self):
+        p = make_plugin()
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 send")))
+        self.assertIn("模板快捷发送用法", reply_text(result))
+
+    def test_normal_send_not_hijacked_by_subcommand(self):
+        # send@qq.com 等普通收件人不能被 send 子命令误拦截
+        p = make_plugin()
+        p._send_sync = lambda msg, max_mb: []
+        result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 sender@x.com | 主题 | 正文")))
+        self.assertIn("已发送到", reply_text(result))
 
 
 if __name__ == "__main__":

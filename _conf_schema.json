@@ -93,5 +93,30 @@
     "description": "每轮最多推送的新邮件数（防刷屏）",
     "type": "int",
     "default": 5
+  },
+  "summary_push_enabled": {
+    "description": "是否启用定时摘要推送（按 summary_schedule_* 配置的时间点自动检查新邮件并生成摘要，推送到 summary_targets）",
+    "type": "bool",
+    "default": true
+  },
+  "summary_schedule_mode": {
+    "description": "摘要推送调度模式：daily（每天）/ weekly（每周）",
+    "type": "string",
+    "default": "daily"
+  },
+  "summary_schedule_time": {
+    "description": "摘要推送触发时间（HH:MM 格式，默认每天 09:00）",
+    "type": "string",
+    "default": "09:00"
+  },
+  "summary_schedule_weekday": {
+    "description": "每周模式下的触发日（1=周一 .. 7=周日）",
+    "type": "int",
+    "default": 1
+  },
+  "summary_targets": {
+    "description": "定时摘要推送目标会话列表，格式为 unified_msg_origin（如 云晓:GroupMessage:群号），多个用逗号分隔；留空则不推送",
+    "type": "string",
+    "default": ""
   }
 }
