@@ -270,6 +270,16 @@ class SendMailPlugin(Star):
             if kind == "url":
                 msg.attach(_UrlPlaceholder(value, self._filename_from_url(value)))
             else:
+                size_mb = max(1, self._int_cfg("attach_max_mb", 10))
+                try:
+                    if os.path.getsize(value) > size_mb * 1024 * 1024:
+                        logger.warning(
+                            f"本地附件超过 {size_mb}MB 上限，已跳过: {value}"
+                        )
+                        continue
+                except OSError as e:
+                    logger.warning(f"读取本地附件大小失败，已跳过: {value}: {e}")
+                    continue
                 with open(value, "rb") as f:
                     data = f.read()
                 msg.attach(_file_part(os.path.basename(value), data))
@@ -374,7 +384,12 @@ class SendMailPlugin(Star):
             with open(pkg_file, encoding="utf-8") as f:
                 bin_map = json.load(f).get("bin") or {}
             if bin_map:
-                entry = next(iter(bin_map.values()))
+                # npm 允许 "bin" 为字符串或对象；字符串时直接作为入口
+                entry = (
+                    bin_map
+                    if isinstance(bin_map, str)
+                    else next(iter(bin_map.values()))
+                )
         except Exception:
             pass
         main_js = os.path.join(pkg_dir, entry)
@@ -592,7 +607,10 @@ class SendMailPlugin(Star):
                 )
             else:
                 try:
-                    msg = self._build_mime(recipients, subject, body, attachments)
+                    # _build_mime 含本地附件读盘，放入线程避免阻塞事件循环
+                    msg = await asyncio.to_thread(
+                        self._build_mime, recipients, subject, body, attachments
+                    )
                 except Exception as e:
                     logger.error(f"构建邮件失败: {e}")
                     return f"❌ 构建邮件失败: {e}"
@@ -668,7 +686,10 @@ class SendMailPlugin(Star):
         """
         if not event.is_admin():
             return "❌ 仅管理员可以使用邮件读取功能。"
-        limit = max(1, min(int(limit or 5), 10))
+        try:
+            limit = max(1, min(int(limit or 5), 10))
+        except (TypeError, ValueError):
+            limit = 5
         if include_body:
             limit = min(limit, 5)  # 避免超出 CLI 每分钟请求配额
         try:
@@ -805,26 +826,35 @@ class SendMailPlugin(Star):
         if not new_items:
             return
 
-        max_mails = max(1, min(self._int_cfg("auto_summary_max_mails", 5), 10))
-        new_items = new_items[:max_mails]
-        seen.update(current_ids)
-        self._save_seen_ids(seen)
-
         targets = [t for t in targets if self._valid_target_umo(t)]
         if not targets:
             logger.warning(
                 "【sendmail】auto_summary_targets 无合法目标会话"
                 "（格式: 平台:GroupMessage/FriendMessage:会话ID，如 云晓:GroupMessage:群号）"
             )
+            # 目标全非法：不消费邮件，下一轮仍可重试
             return
+
+        max_mails = max(1, min(self._int_cfg("auto_summary_max_mails", 5), 10))
+        new_items = new_items[:max_mails]
 
         text = await self._build_summary_text(new_items)
         chain = MessageChain([Plain(text)])
+        ok_targets = 0
         for target in targets:
             try:
                 await self.context.send_message(target, chain)
+                ok_targets += 1
             except Exception as e:
                 logger.error(f"【sendmail】推送到 {target} 失败: {e}")
+        if ok_targets == 0:
+            logger.warning(
+                "【sendmail】全部推送目标发送失败，不标记已读，下一轮将重试"
+            )
+            return
+        # 仅标记实际推送的邮件，避免积压超过上限的部分被静默丢弃
+        seen.update(it.get("message_id") for it in new_items)
+        self._save_seen_ids(seen)
         logger.info(f"【sendmail】已推送 {len(new_items)} 封新邮件总结到 {len(targets)} 个会话")
 
     async def _build_summary_text(self, items: list[dict]) -> str:
@@ -833,7 +863,12 @@ class SendMailPlugin(Star):
         detail: list[str] = []
         for i, it in enumerate(items, 1):
             subject = it.get("subject") or "(无主题)"
-            frm = (it.get("from") or {}).get("email") or "?"
+            frm_obj = it.get("from")
+            frm = (
+                frm_obj.get("email")
+                if isinstance(frm_obj, dict)
+                else str(frm_obj or "?")
+            )
             created = (it.get("created_at") or "")[:16].replace("T", " ")
             snippet = (it.get("snippet") or "").strip()
             detail.append(f"【{i}】{subject}\n   发件人: {frm}  时间: {created}\n   摘要: {snippet or '（无摘要）'}")
