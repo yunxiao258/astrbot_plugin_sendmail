@@ -185,8 +185,10 @@ class SendMailPlugin(Star):
         self._history = self._history[-50:]
         try:
             os.makedirs(os.path.dirname(self._history_path), exist_ok=True)
-            with open(self._history_path, "w", encoding="utf-8") as f:
+            tmp = self._history_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._history, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._history_path)
         except Exception as e:
             logger.warning(f"保存邮件发送日志失败: {e}")
 
@@ -760,8 +762,10 @@ class SendMailPlugin(Star):
     def _save_seen_ids(self, ids: set[str]) -> None:
         try:
             os.makedirs(os.path.dirname(self._seen_path), exist_ok=True)
-            with open(self._seen_path, "w", encoding="utf-8") as f:
+            tmp = self._seen_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(sorted(ids), f, ensure_ascii=False)
+            os.replace(tmp, self._seen_path)
         except OSError as e:
             logger.error(f"保存已读邮件记录失败: {e}")
 
