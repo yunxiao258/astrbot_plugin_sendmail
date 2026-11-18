@@ -748,7 +748,10 @@ class TestAgentlyCommand(unittest.TestCase):
         p2 = make_plugin(agently_cli_path="")
         cmd = p2._agently_cmd()
         self.assertTrue(cmd, "应解析出非空命令")
-        self.assertTrue(os.path.exists(cmd[0]), f"命令应存在: {cmd}")
+        if shutil.which("agently-cli"):
+            self.assertTrue(os.path.exists(cmd[0]), f"命令应存在: {cmd}")
+        else:
+            self.assertEqual(cmd, ["agently-cli"])
 
     def test_agently_shim_resolved_to_node(self):
         # Windows npm .cmd shim 应解析为 [node.exe, 包主入口]，绕过 cmd.exe 换行截断
