@@ -1,0 +1,234 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests httpx
+      - name: Compile & validate metadata / schema
+        run: |
+          python -m compileall -q .
+          python - <<'PY'
+          import json, yaml
+          meta = yaml.safe_load(open("metadata.yaml", encoding="utf-8"))
+          for k in ("name", "desc", "version", "author"):
+              assert isinstance(meta.get(k), str) and meta[k].strip(), f"missing/invalid metadata.{k}"
+          with open("_conf_schema.json", encoding="utf-8-sig") as f:
+              schema = json.load(f)
+          assert isinstance(schema, dict)
+          print("metadata & schema OK:", meta["name"], meta["version"])
+          PY
+      - name: Run plugin tests
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys, tempfile, pathlib, textwrap
+
+          repo = pathlib.Path.cwd()
+          stub = pathlib.Path(tempfile.mkdtemp(prefix="astrbot_stub_"))
+          pkg = stub / "astrbot"
+          for sub in [
+              "", "api", "api/event", "core", "core/message",
+              "core/provider", "core/star", "core/star/filter", "core/utils"
+          ]:
+              (pkg / sub).mkdir(parents=True, exist_ok=True)
+              (pkg / sub / "__init__.py").write_text("", encoding="utf-8")
+
+          def w(rel, content):
+              (pkg / rel).write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
+
+          w("api/__init__.py", '''
+              import logging
+              logger = logging.getLogger("astrbot")
+              class AstrBotConfig(dict): pass
+              def llm_tool(*a, **kw):
+                  if a and callable(a[0]) and len(a) == 1 and not kw:
+                      return a[0]
+                  return lambda fn: fn
+          ''')
+
+          w("api/platform.py", '''
+              from enum import Enum
+              class MessageType(str, Enum):
+                  GROUP_MESSAGE = "GroupMessage"
+                  FRIEND_MESSAGE = "FriendMessage"
+                  OTHER_MESSAGE = "OtherMessage"
+              class MessageMember:
+                  def __init__(self, user_id="", nickname="", **kw):
+                      self.user_id = user_id
+                      self.nickname = nickname
+              class AstrBotMessage:
+                  def __init__(self, **kw):
+                      self.__dict__.update(kw)
+          ''')
+
+          w("core/__init__.py", "astrbot_config = {}\n")
+
+          w("core/message/components.py", '''
+              class BaseMessageComponent: pass
+              class Plain(BaseMessageComponent):
+                  type = "Plain"
+                  def __init__(self, text="", **kw):
+                      self.text = text
+              class At(BaseMessageComponent):
+                  type = "At"
+                  def __init__(self, qq=0, name="", **kw):
+                      self.qq = qq
+                      self.name = name
+              class AtAll(At):
+                  type = "AtAll"
+                  def __init__(self, **kw):
+                      super().__init__(qq="all", name="全体成员", **kw)
+              class Image(BaseMessageComponent):
+                  type = "Image"
+                  def __init__(self, file="", url="", **kw):
+                      self.file = file
+                      self.url = url
+                      self.__dict__.update(kw)
+                  @classmethod
+                  def fromFileSystem(cls, path):
+                      return cls(file=path)
+                  @classmethod
+                  def fromBytes(cls, data):
+                      return cls(data=data)
+              class Record(BaseMessageComponent):
+                  type = "Record"
+                  def __init__(self, file="", url="", **kw):
+                      self.file = file
+                      self.url = url
+                      self.__dict__.update(kw)
+                  @classmethod
+                  def fromURL(cls, url):
+                      return cls(url=url)
+                  @classmethod
+                  def fromFileSystem(cls, path):
+                      return cls(file=path)
+                  @classmethod
+                  def fromBytes(cls, data):
+                      return cls(data=data)
+              class File(BaseMessageComponent):
+                  type = "File"
+                  def __init__(self, name="", file="", **kw):
+                      self.name = name
+                      self.file = file
+              class Music(BaseMessageComponent):
+                  type = "Music"
+                  def __init__(self, **kw):
+                      self.__dict__.update(kw)
+              class Reply(BaseMessageComponent):
+                  type = "Reply"
+                  def __init__(self, id="", **kw):
+                      self.id = id
+          ''')
+
+          w("api/message_components.py", "from astrbot.core.message.components import *\n")
+
+          w("core/message/message_event_result.py", '''
+              class MessageChain:
+                  def __init__(self, chain=None):
+                      self.chain = list(chain or [])
+                  def message(self, t):
+                      from astrbot.core.message.components import Plain
+                      self.chain.append(Plain(t))
+                      return self
+                  def file_image(self, p):
+                      from astrbot.core.message.components import Image
+                      self.chain.append(Image(file=p))
+                      return self
+                  def url_image(self, u):
+                      from astrbot.core.message.components import Image
+                      self.chain.append(Image(url=u))
+                      return self
+                  def get_plain_text(self):
+                      return "".join(getattr(c, "text", "") for c in self.chain)
+              class MessageEventResult(MessageChain): pass
+          ''')
+
+          w("api/all.py", '''
+              from astrbot.core.message.components import *
+              from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
+              from astrbot.api.platform import MessageType
+          ''')
+
+          w("api/event/filter.py", '''
+              from enum import Enum
+              class EventMessageType(str, Enum):
+                  ALL = "all"
+                  GROUP_MESSAGE = "GroupMessage"
+                  PRIVATE_MESSAGE = "FriendMessage"
+              class PermissionType(str, Enum):
+                  ADMIN = "admin"
+                  MEMBER = "member"
+              def _wrap(fn):
+                  if callable(fn):
+                      fn.command = _dec
+                      fn.group = _dec
+                  return fn
+              def _dec(*a, **kw):
+                  if a and callable(a[0]) and len(a) == 1 and not kw:
+                      return _wrap(a[0])
+                  return _wrap
+              command = command_group = regex = event_message_type = permission_type = on_message = on_astrbot_loaded = on_plugin_loaded = on_plugin_unloaded = on_plugin_error = on_llm_request = on_llm_response = on_decorating_result = after_message_sent = _dec
+          ''')
+
+          w("api/event/__init__.py", '''
+              from astrbot.api.event import filter
+              class AstrMessageEvent: pass
+          ''')
+
+          _llm_resp = '''
+              class LLMResponse:
+                  def __init__(self, role="assistant", completion_text=None, result_chain=None, **kw):
+                      self.role = role
+                      self.completion_text = completion_text
+                      self.result_chain = result_chain
+                      self.__dict__.update(kw)
+          '''
+          w("api/provider.py", "class ProviderRequest:\n    def __init__(self, **kw): self.__dict__.update(kw)\n" + _llm_resp)
+          w("core/provider/entities.py", _llm_resp)
+          w("core/star/filter/command.py", "class GreedyStr(str): pass\nclass CommandFilter: pass\n")
+          w("core/star/star.py", "class StarMetadata:\n    def __init__(self, **kw): self.__dict__.update(kw)\n")
+          w("core/star/command_management.py", "async def list_commands(*a, **kw): return []\n")
+          w("core/utils/astrbot_path.py", '''
+              import os, tempfile
+              def get_astrbot_data_path():
+                  return os.path.join(tempfile.gettempdir(), "astrbot_ci_data")
+          ''')
+          w("api/star.py", '''
+              class Context: pass
+              class Star:
+                  def __init__(self, context=None, *a, **kw):
+                      self.context = context
+              def register(*a, **kw):
+                  return lambda cls: cls
+          ''')
+
+          env = os.environ.copy()
+          env["PYTHONPATH"] = os.pathsep.join([str(stub), str(repo.parent), str(repo)])
+          cwd = tempfile.mkdtemp(prefix="ci_cwd_")
+          test_files = sorted(repo.glob("test_*.py"))
+          assert test_files, "No test_*.py found!"
+          for tf in test_files:
+              txt = tf.read_text(encoding="utf-8", errors="replace")
+              print(f"=== Running {tf.name} ===", flush=True)
+              if "unittest.TestCase" in txt and "unittest.main" not in txt and "if __name__" not in txt:
+                  cmd = [sys.executable, "-m", "unittest", str(tf), "-v"]
+              else:
+                  cmd = [sys.executable, str(tf)]
+              r = subprocess.run(cmd, cwd=cwd, env=env)
+              if r.returncode != 0:
+                  sys.exit(r.returncode)
+          print("ALL CI TESTS PASSED!")
+          PY

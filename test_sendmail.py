@@ -16,8 +16,9 @@ from astrbot.api.all import MessageChain
 from astrbot.api.message_components import Plain
 from astrbot.core.provider.entities import LLMResponse
 
-sys.path.insert(0, r"D:\astrbot\data\plugins")
-sys.path.insert(0, r"D:\astrbot\data\plugins\astrbot_plugin_sendmail")
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_PLUGIN_DIR))
+sys.path.insert(0, _PLUGIN_DIR)
 
 from astrbot_plugin_sendmail.main import (  # noqa: E402
     MAIL_TEMPLATES,
@@ -1355,6 +1356,25 @@ class TestTemplateCommand(unittest.TestCase):
         p._send_sync = lambda msg, max_mb: []
         result = asyncio.run(p.cmd_mail(FakeEvent("/邮件 sender@x.com | 主题 | 正文")))
         self.assertIn("已发送到", reply_text(result))
+
+    def test_v141_lifecycle_idempotent(self):
+        p = make_plugin(auto_summary_enabled=True)
+
+        async def fake_loop():
+            await asyncio.sleep(60)
+
+        p._mail_watcher_loop = fake_loop
+
+        async def scenario():
+            await p.initialize()
+            t1 = p._mail_watcher_task
+            self.assertIsNotNone(t1)
+            await p.initialize()
+            self.assertIs(p._mail_watcher_task, t1)
+            await p.terminate()
+            self.assertIsNone(p._mail_watcher_task)
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

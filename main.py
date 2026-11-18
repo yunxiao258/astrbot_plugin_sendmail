@@ -50,7 +50,7 @@ render_template = _mail_templates.render_template
 PLUGIN_NAME = "astrbot_plugin_sendmail"
 PLUGIN_AUTHOR = "云晓"
 PLUGIN_DESC = "邮件助手：管理员让 AI 发送/读取邮件，定时总结推送新邮件"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 
 # 邮件服务商预设：provider -> (host, port, ssl)
 SMTP_PRESETS = {
@@ -171,13 +171,16 @@ class SendMailPlugin(Star):
         """插件加载/重载时启动定时邮件检查任务"""
         await self._start_mail_watcher()
 
-    @filter.on_astrbot_loaded()
     async def _start_mail_watcher(self) -> None:
         """启动定时邮件检查任务（幂等：重复调用不会重复启动）"""
         if not self._bool_cfg("auto_summary_enabled", True):
             logger.info("【sendmail】定时邮件总结已禁用")
             return
         if self._mail_watcher_task and not self._mail_watcher_task.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
             return
         self._mail_watcher_task = asyncio.create_task(self._mail_watcher_loop())
         self._mail_watcher_task.add_done_callback(
