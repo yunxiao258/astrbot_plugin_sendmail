@@ -1,6 +1,6 @@
 # astrbot_plugin_sendmail
 
-邮件发送助手插件（AstrBot），版本 **1.5.0**，许可证 **MIT**。
+邮件发送助手插件（AstrBot），版本 **1.5.1**，许可证 **MIT**。
 管理员可以通过 `/邮件` 命令发送邮件，也可以直接让 AI 调用 `send_mail` / `read_mail` 工具自动收发邮件；新邮件支持定时摘要推送、按规则自动转发、内置模板快捷发送。
 
 ## 功能特性
@@ -201,6 +201,9 @@ AI 用法示例（对 AI 说）：
 - Agent Mail 通道：需额外安装 `@tencent-qqmail/agently-cli`（npm）
 
 ## 更新记录
+
+### v1.5.1
+- 修复 `hub_status()` 读取错误配置键 `mail_channel`（应为 `send_channel`）导致通道展示不准的 bug，以及 `hub_action("send_mail")` 将限流提示 `⏳` 误判为成功的 bug
 
 ### v1.5.0
 - 接入插件生态中枢标准联动协议：开放 `send_mail` 与 `get_history` 供群聊摘要抄送与运维邮件告警复用

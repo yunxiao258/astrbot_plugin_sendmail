@@ -35,7 +35,7 @@ from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api.all import MessageChain
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Plain
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
 # 内置邮件模板（模板快捷发送）。AstrBot 以 data.plugins.xxx.main 包路径加载插件，
 # 故优先相对导入；测试等场景兜底为顶层导入
@@ -55,7 +55,7 @@ try:
 except ImportError:
     from hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
 
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.5.1"
 
 # 邮件服务商预设：provider -> (host, port, ssl)
 SMTP_PRESETS = {
@@ -1353,7 +1353,7 @@ class SendMailPlugin(Star):
         return {
             "version": PLUGIN_VERSION,
             "status": "online",
-            "metrics": {"发送记录": len(self._history), "转发规则": len(self._rules), "发信通道": str(self.config.get("mail_channel", "smtp"))},
+            "metrics": {"发送记录": len(self._history), "转发规则": len(self._rules), "发信通道": str(self.config.get("send_channel", "smtp"))},
             "actions": ["get_history", "send_mail"],
         }
 
@@ -1374,7 +1374,7 @@ class SendMailPlugin(Star):
                 def get_sender_id(self): return "hub"
                 def get_sender_name(self): return "PluginHub"
             res_txt = await self._dispatch_send(_HubEvt(), recipients, subject, body, [])
-            ok = not str(res_txt).startswith("❌")
+            ok = str(res_txt).startswith("✅")
             return {"ok": ok, "data": {"message": res_txt}, "error": "" if ok else res_txt}
         return {"ok": False, "error": f"不支持的动作：{action}"}
 
