@@ -50,7 +50,12 @@ render_template = _mail_templates.render_template
 PLUGIN_NAME = "astrbot_plugin_sendmail"
 PLUGIN_AUTHOR = "云晓"
 PLUGIN_DESC = "邮件助手：管理员让 AI 发送/读取邮件，定时总结推送新邮件"
-PLUGIN_VERSION = "1.4.1"
+try:
+    from .hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
+except ImportError:
+    from hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
+
+PLUGIN_VERSION = "1.5.0"
 
 # 邮件服务商预设：provider -> (host, port, ssl)
 SMTP_PRESETS = {
@@ -142,6 +147,7 @@ def _file_part(name: str, data: bytes) -> MIMEApplication:
 
 
 class SendMailPlugin(Star):
+    HUB_PROTOCOL_VERSION = HUB_PROTOCOL_VERSION
     """邮件发送助手：管理员按命令发送邮件，AI 工具发送/读取，定时总结推送"""
 
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -709,6 +715,7 @@ class SendMailPlugin(Star):
             lines.append(f"⚠️ 附件无效已忽略: {', '.join(attach_failed)}")
         if failed:
             lines.append(f"⚠️ 以下附件下载失败: {', '.join(failed)}")
+        emit_hub_event("astrbot_plugin_sendmail", "sendmail.sent", {"recipients": recipients, "subject": subject}, self.context)
         return "\n".join(lines)
 
     @llm_tool(name="send_mail")
@@ -1341,6 +1348,35 @@ class SendMailPlugin(Star):
         if getattr(resp, "role", "") == "err":
             raise RuntimeError(text or "LLM 返回错误")
         return text
+
+    def hub_status(self) -> dict:
+        return {
+            "version": PLUGIN_VERSION,
+            "status": "online",
+            "metrics": {"发送记录": len(self._history), "转发规则": len(self._rules), "发信通道": str(self.config.get("mail_channel", "smtp"))},
+            "actions": ["get_history", "send_mail"],
+        }
+
+    async def hub_action(self, action: str, params: dict | None = None) -> dict:
+        p = params or {}
+        if action == "get_history":
+            lim = max(1, min(50, int(p.get("limit", 10))))
+            return {"ok": True, "data": list(self._history[-lim:])}
+        if action == "send_mail":
+            to = str(p.get("to", "")).strip()
+            subject = str(p.get("subject", "")).strip()
+            body = str(p.get("body", "")).strip()
+            recipients = self._parse_recipients(to)
+            if not recipients or not subject or not body:
+                return {"ok": False, "error": "缺少有效收件人 / 主题 / 正文"}
+            class _HubEvt:
+                def is_admin(self): return True
+                def get_sender_id(self): return "hub"
+                def get_sender_name(self): return "PluginHub"
+            res_txt = await self._dispatch_send(_HubEvt(), recipients, subject, body, [])
+            ok = not str(res_txt).startswith("❌")
+            return {"ok": ok, "data": {"message": res_txt}, "error": "" if ok else res_txt}
+        return {"ok": False, "error": f"不支持的动作：{action}"}
 
 
 class _UrlPlaceholder:
