@@ -1,6 +1,6 @@
 # astrbot_plugin_sendmail
 
-邮件发送助手插件（AstrBot），版本 **1.4.0**，许可证 **MIT**。
+邮件发送助手插件（AstrBot），版本 **1.4.1**，许可证 **MIT**。
 管理员可以通过 `/邮件` 命令发送邮件，也可以直接让 AI 调用 `send_mail` / `read_mail` 工具自动收发邮件；新邮件支持定时摘要推送、按规则自动转发、内置模板快捷发送。
 
 ## 功能特性
@@ -216,4 +216,4 @@ AI 用法示例（对 AI 说）：
 python -m unittest test_sendmail -v
 ```
 
-测试共 120 个，覆盖命令解析、HTML 转换、MIME 构建、SMTP 发送、Agent Mail 通道、AI 工具、转发规则匹配与持久化、定时摘要调度与推送、模板渲染与命令。
+测试共 121 个，覆盖命令解析、HTML 转换、MIME 构建、SMTP 发送、Agent Mail 通道、AI 工具、转发规则匹配与持久化、定时摘要调度与推送、模板渲染与命令。
